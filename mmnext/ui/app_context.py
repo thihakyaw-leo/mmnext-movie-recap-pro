@@ -601,7 +601,8 @@ class AppContext(QObject):
         artifact_source = str(data.get("source_path", ""))
         if not artifact_source:
             raise ValueError("Transcript artifact has no source path")
-        if not is_source_available(job.source.location, job.source.source_type):
+        source_type_val = getattr(job.source.source_type, "value", job.source.source_type)
+        if not is_source_available(job.source.location, source_type_val):
             raise ValueError(
                 f"Source media is unavailable: {job.source.location}. "
                 "Restore the file and reopen, or re-transcribe."
@@ -784,6 +785,7 @@ class AppContext(QObject):
         if self._job_repository is not None:
             try:
                 from ..domain.enums import JobState
+                from ..domain.fingerprint import FINGERPRINT_SCHEMA_VERSION
                 from ..domain.models import Job, JobProgress, VideoSource
                 from ..infrastructure.repository.job_repository import compute_fingerprint
                 source_path = provider.source_path
@@ -791,7 +793,7 @@ class AppContext(QObject):
                 job_id = provider.job_id
                 source_type = self.session.source.source_type.value if self.session.source else ""
                 fp = getattr(provider, "fingerprint", "") or compute_fingerprint(
-                    source_path, source_type, mode, schema_version=1
+                    source_path, source_type, mode, schema_version=FINGERPRINT_SCHEMA_VERSION
                 )
                 artifact_path = str(provider.artifact_path) if hasattr(provider, "artifact_path") else ""
                 job = Job(
