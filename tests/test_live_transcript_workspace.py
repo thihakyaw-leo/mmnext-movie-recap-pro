@@ -162,6 +162,8 @@ def test_job_persistence_failure_is_visible_and_not_silent(
     assert any(
         "Job persistence failed" in entry.message for entry in ctx.log_entries()
     )
+    assert real_window._workspace.transcript_progress.value() == 0
+    assert real_window._workspace.transcribe_button.isEnabled()
 
 
 def test_real_tool_failure_visible_in_ui(real_window, qtbot, monkeypatch, tmp_path):
