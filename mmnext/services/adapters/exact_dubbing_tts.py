@@ -33,9 +33,10 @@ import asyncio
 import hashlib
 import math
 import os
-import struct
+import sys
 import time
 import wave
+from array import array
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -211,13 +212,16 @@ class LocalWaveTtsAdapter(_BaseExactDubbingTts):
         frames = int(round(duration * self.sample_rate))
         path.parent.mkdir(parents=True, exist_ok=True)
         step = 2 * math.pi * self.frequency / self.sample_rate
+        # The whole clip is built in one buffer and written once; a per-sample
+        # write would cost hundreds of thousands of Python calls.
+        samples = array("h", (int(3000 * math.sin(step * index)) for index in range(frames)))
+        if sys.byteorder != "little":
+            samples.byteswap()
         with wave.open(str(path), "wb") as handle:
             handle.setnchannels(1)
             handle.setsampwidth(2)
             handle.setframerate(self.sample_rate)
-            for index in range(frames):
-                value = int(3000 * math.sin(step * index))
-                handle.writeframesraw(struct.pack("<h", value))
+            handle.writeframesraw(samples.tobytes())
 
     def synthesize_segment(
         self,

@@ -11,6 +11,7 @@ step and the render step, exactly as it is in the legacy pipeline.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -20,7 +21,6 @@ from ..domain.exact_dubbing import (
     validate_against_source,
 )
 from ..domain.models import ExactDubbingRow
-from ..domain.paths import read_json
 from ..infrastructure.exact_dubbing_render import FfmpegExactDubbingRenderer
 from ..services.adapters.exact_dubbing_tts import (
     DemoExactDubbingTtsAdapter,
@@ -76,32 +76,58 @@ class ExactDubbingService:
         settings: Optional[dict] = None,
         log: Optional[Callable[[str], None]] = None,
     ) -> ExactDubbingRenderCoordinator:
-        """Return a coordinator wired to the real renderer."""
+        """Return a coordinator wired to the real renderer.
+
+        The ``log`` callback is handed to the synthesiser and to the renderer
+        as well, so a REAL failure keeps its reason instead of being reduced
+        to a generic "Render failed".
+        """
         settings = dict(settings or {})
         cache_dir = str(settings.get("tts_cache_dir") or self.cache_dir)
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        tts = LegacyExactDubbingTtsAdapter(cache_dir=cache_dir, log=log)
-        if not tts.available():
-            tts = DemoExactDubbingTtsAdapter(cache_dir=cache_dir, log=log)
+        real_tts = LegacyExactDubbingTtsAdapter(cache_dir=cache_dir, log=log)
+        # The availability has to be read *before* the fallback: the demo
+        # synthesiser is always available, so asking it would report a
+        # simulated speech run as REAL.
+        has_real_tts = real_tts.available()
+        tts = (
+            real_tts
+            if has_real_tts
+            else DemoExactDubbingTtsAdapter(cache_dir=cache_dir, log=log)
+        )
         renderer = FfmpegExactDubbingRenderer(
             ffmpeg=self._ffmpeg,
             ffprobe=self._ffprobe,
             log=log,
             work_dir=str(Path(cache_dir).parent / "exact_dubbing_work"),
         )
+        settings.setdefault("ffprobe", self._ffprobe)
         return ExactDubbingRenderCoordinator(
             tts=tts,
             renderer=renderer,
-            is_demo=not tts.available(),
+            is_demo=not has_real_tts,
             log=log,
         )
 
     # -- translation file ---------------------------------------------------- #
     def load_translated_gender(self, path: str) -> list[DubbingTranslation]:
-        """Read and validate a ``translated_gender.json`` file."""
-        payload = read_json(path)
-        if payload is None:
+        """Read and validate a ``translated_gender.json`` file.
+
+        The legacy reader used ``utf-8-sig``, so a file with a byte-order mark
+        is still accepted.  A missing file and an unreadable file are
+        different problems and are reported differently.
+        """
+        target = Path(path)
+        if not target.is_file():
             raise FileNotFoundError(f"Translation file not found: {path}")
+        try:
+            text = target.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise ValueError(f"Translation file could not be read: {path} ({exc})") from exc
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Translation file is not valid JSON: {path} ({exc})") from exc
         return parse_translated_gender(payload)
 
     def validate_translation(
@@ -133,6 +159,9 @@ class ExactDubbingService:
         partial render.
         """
         settings = dict(settings or {})
+        # The caller's duration is carried as a *claim*: the renderer compares
+        # it with the probed media and reports a source change.
+        settings.setdefault("total_duration", total_duration)
         self.validate_translation(translation_path, source_rows)
         coordinator = self.create_coordinator(settings=settings, log=log)
         return coordinator.run(

@@ -27,7 +27,9 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
+
+from .enums import Gender
 
 __all__ = [
     "EXACT_DUB_VOICES",
@@ -45,13 +47,15 @@ __all__ = [
 #: Myanmar block (U+1000-U+109F) plus Myanmar Extended-A (U+AA60-U+AA7F).
 MYANMAR_UNICODE_PATTERN = re.compile(r"[\u1000-\u109f\uaa60-\uaa7f]")
 
-#: Gender -> Edge TTS Myanmar voice (legacy ``movie-recap`` mapping).
+#: Gender -> Edge TTS Myanmar voice.  The mapping itself lives on the
+#: :class:`~mmnext.domain.enums.Gender` enum, so there is only one source of
+#: truth for the legacy mapping.
 EXACT_DUB_VOICES: dict[str, str] = {
-    "male": "my-MM-ThihaNeural",
-    "female": "my-MM-NilarNeural",
+    "male": Gender.MALE.voice,
+    "female": Gender.FEMALE.voice,
     # An uncertain speaker falls back to the female voice, exactly like the
     # legacy pipeline.  It is never derived from biometric analysis.
-    "unknown": "my-MM-NilarNeural",
+    "unknown": Gender.UNKNOWN.voice,
 }
 
 #: Source timing may never drift by more than this (seconds).
@@ -119,8 +123,12 @@ def parse_translated_gender(payload: Any) -> list[DubbingTranslation]:
 
     Raises :class:`ValueError` with a precise message for every rejected
     shape: a wrong container type, a missing key, a non-finite number, an
-    empty Burmese text, a row that still contains Latin text only, or an
-    unknown gender.
+    empty Burmese text, a row whose Burmese text contains no Myanmar
+    codepoint at all, or an unknown gender.
+
+    A row that mixes English and Burmese is *accepted*, exactly as the legacy
+    pipeline accepted it; only a row without any Myanmar codepoint is
+    refused.
     """
     if not isinstance(payload, list):
         raise ValueError("translated_gender.json must contain a JSON array of rows")
@@ -281,19 +289,3 @@ def atempo_chain(ratio: float) -> str:
     parts.append(f"atempo={value:.9f}")
     return ",".join(parts)
 
-
-def windows_for_rows(
-    rows: Sequence[DubbingTranslation],
-    total: float,
-) -> list[float]:
-    """Return the speech window of every row, in order."""
-    windows: list[float] = []
-    for index, row in enumerate(rows):
-        next_start = rows[index + 1].start if index + 1 < len(rows) else None
-        windows.append(speech_window(row.start, row.duration, next_start, total))
-    return windows
-
-
-def iter_genders(rows: Iterable[Any]) -> list[str]:
-    """Return the gender of every row as a plain string."""
-    return [str(getattr(row, "gender", "unknown")) for row in rows]

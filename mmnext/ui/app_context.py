@@ -510,15 +510,30 @@ class AppContext(QObject):
         settings.setdefault("tts_cache_dir", cache_dir)
         settings.setdefault("voice", "my-MM-NilarNeural")
         settings.setdefault("rate", 1.0)
-        # The authoritative source duration travels with the run so the
-        # renderer can validate the output against it.
+        # The caller's duration travels as a claim: the renderer compares it
+        # with the probed media and reports a source change.
         settings.setdefault("total_duration", duration)
 
         # The UI never imports infrastructure: the application facade owns the
-        # real FFmpeg renderer and the real Edge TTS synthesiser.
+        # real FFmpeg renderer and the real Edge TTS synthesiser.  The log
+        # callback is handed to both, so a REAL failure keeps its reason.
         service = ExactDubbingService(self._jobs_dir)
-        coordinator = service.create_coordinator(settings=settings)
-        is_demo = coordinator.is_demo
+
+        # ``translated_gender.json`` is the contract between the translation
+        # step and the render step.  The render consumes the exported file, so
+        # a drifted or unreadable translation refuses the render instead of
+        # producing a dub that does not match the source rows.
+        translation_path = str(
+            Path(self._jobs_dir) / "exact_dubbing" / "translated_gender.json"
+        )
+        self.export_exact_dubbing(translation_path)
+        service.validate_translation(translation_path, rows)
+
+        coordinator = service.create_coordinator(
+            settings=settings, log=self._on_exact_render_log
+        )
+        # A demo session can never be announced as a REAL render.
+        is_demo = bool(session.is_demo) or coordinator.is_demo
         thread = ExactDubbingRenderThread(
             coordinator, rows, source_path, duration, target_path, settings, parent=self
         )
@@ -534,7 +549,12 @@ class AppContext(QObject):
     def stop_exact_dubbing_render(self) -> None:
         if self.exact_render_running:
             self._exact_render_thread.stop()
-            self._set_exact_render_state("stopping", "Stop requested; finishing current row.")
+            # The stop is honoured between synthesis rows and after the render
+            # stage; FFmpeg itself is never killed mid-flight.
+            self._set_exact_render_state(
+                "stopping",
+                "Stop requested; the run stops at the next stage boundary.",
+            )
 
     def _set_exact_render_state(self, state: str, message: str) -> None:
         self.exact_render_state = state
@@ -548,6 +568,10 @@ class AppContext(QObject):
         self.append_log(LogEntry(message=message, stage=Stage.IDLE))
 
     def _on_exact_render_result(self, result) -> None:
+        # The speed-fit warnings are part of the result and must reach the
+        # user: a segment that needed 1.4x speed is a translation problem.
+        for warning in getattr(result, "warnings", []) or []:
+            self.append_log(LogEntry(message=str(warning), stage=Stage.RENDER))
         if getattr(result, "stopped", False):
             self._set_exact_render_state("stopped", "Exact dubbing render stopped.")
         elif getattr(result, "ok", False):

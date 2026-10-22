@@ -389,8 +389,13 @@ are fixed and each has a regression test.
      `mmnext/application/exact_dubbing_service.py` is the UI-facing facade.
      The renderer, the fit, the mix, the mux and the final validation are
      REAL and exercised by `tests/test_exact_dubbing_render.py`; only the
-     *speech* is still DEMO because `edge_tts` is not installed. See
-     `checklist.md` § U.
+     *speech* is still DEMO because `edge_tts` is not installed. A follow-up
+     code-review cycle fixed seven defects in this slice, including a
+     **deadlock in the product path** (the first `import numpy` happened on
+     the worker thread and could hang the interpreter) and a **truncated
+     output that passed validation** (a caller-supplied duration overrode the
+     probed media duration). The UI path is now covered by a real end-to-end
+     test. See `checklist.md` § U.
 3. Splitter planner, smart-cut/short-tail rules, per-part resume.
 4. Common Editing non-destructive timeline, overlays, export validation.
 5. Windows packaging, diagnostics, clean-machine and non-ASCII path testing.

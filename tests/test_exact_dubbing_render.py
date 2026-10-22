@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 
 import pytest
@@ -33,14 +34,14 @@ from mmnext.domain.exact_dubbing import (
 from mmnext.domain.models import ExactDubbingRow
 from mmnext.services.adapters.exact_dubbing_tts import LocalWaveTtsAdapter
 
-pytestmark = pytest.mark.skipif(
-    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
-    reason="FFmpeg/FFprobe are required for the exact-dubbing render",
-)
-
 BURMESE_A = "မြန်မာလို ရှင်းပြပါ"
 BURMESE_B = "ဒီနေ့ ငါ တရားထိုင်ရာက ထွက်လာပြီး နောက်ဆုံးတော့ ကျင့်ကြံမှုအဆင့်သစ်ကို တက်လှမ်းနိုင်ခဲ့ပြီ။"
 BURMESE_C = "ကျင့်ကြံမှုအဆင့်သစ်ကို တက်လှမ်းနိုင်ခဲ့တဲ့အတွက် စီနီယာကြီးကို ကျွန်မ ဂုဏ်ပြုပါတယ်။"
+
+needs_ffmpeg = pytest.mark.skipif(
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="FFmpeg/FFprobe are required for the exact-dubbing render",
+)
 
 
 def make_rows() -> list[ExactDubbingRow]:
@@ -69,7 +70,7 @@ def make_video(path: Path, seconds: float = 4.0) -> Path:
     subprocess.run(
         [
             "ffmpeg", "-v", "error", "-y",
-            "-f", "lavfi", "-i", f"color=c=black:s=320x180:r=15",
+            "-f", "lavfi", "-i", "color=c=black:s=320x180:r=15",
             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
             "-t", f"{seconds}",
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -104,9 +105,30 @@ def probe(path: Path) -> dict:
     completed = subprocess.run(
         ["ffprobe", "-v", "error", "-show_format", "-show_streams",
          "-of", "json", str(path)],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
     )
     return json.loads(completed.stdout)
+
+
+def extract_audio(video: Path, wav: Path) -> Path:
+    """Extract the audio track of ``video`` as a mono 44100 Hz WAV."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(video),
+         "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le", str(wav)],
+        check=True,
+    )
+    return wav
+
+
+def first_sound_sample(wav: Path) -> int:
+    """The index of the first non-silent sample in ``wav``."""
+    with wave.open(str(wav), "rb") as handle:
+        raw = handle.readframes(handle.getnframes())
+    samples = memoryview(raw).cast("h")
+    for index, value in enumerate(samples):
+        if abs(value) > 16:
+            return index
+    return -1
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +217,8 @@ def test_voice_mapping_falls_back_for_unknown() -> None:
     assert voice_for_gender("male") == "my-MM-ThihaNeural"
     assert voice_for_gender("female") == "my-MM-NilarNeural"
     assert voice_for_gender("unknown") == voice_for_gender("female")
+    # The mapping has a single source of truth: the Gender enum.
+    assert EXACT_DUB_VOICES["male"] == Gender.MALE.voice
 
 
 def test_cache_signature_is_content_addressed() -> None:
@@ -202,6 +226,40 @@ def test_cache_signature_is_content_addressed() -> None:
     assert first == cache_signature("my-MM-NilarNeural", BURMESE_A)
     assert first != cache_signature("my-MM-ThihaNeural", BURMESE_A)
     assert first != cache_signature("my-MM-NilarNeural", BURMESE_B)
+
+
+def test_translation_file_with_a_byte_order_mark_is_accepted(tmp_path) -> None:
+    """The legacy reader accepted a BOM; a BOM must not look like a crash."""
+    rows = make_rows()
+    payload = json.dumps(
+        [
+            {"id": index, "row_id": row.row_id, "start": row.start,
+             "duration": row.duration, "original": row.original,
+             "burmese": row.burmese, "gender": row.gender.value}
+            for index, row in enumerate(rows)
+        ],
+        ensure_ascii=False,
+    )
+    path = tmp_path / "translated_gender.json"
+    path.write_text(payload, encoding="utf-8-sig")
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    parsed = service.load_translated_gender(str(path))
+    assert len(parsed) == 2
+
+
+def test_a_missing_translation_file_is_reported_as_missing(tmp_path) -> None:
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    with pytest.raises(FileNotFoundError):
+        service.load_translated_gender(str(tmp_path / "nope.json"))
+
+
+def test_a_malformed_translation_file_is_reported_as_unreadable(tmp_path) -> None:
+    path = tmp_path / "translated_gender.json"
+    path.write_text("{not json", encoding="utf-8")
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    with pytest.raises(ValueError, match="not valid JSON"):
+        service.load_translated_gender(str(path))
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +274,6 @@ def test_local_synthesizer_writes_real_audio(tmp_path) -> None:
                                         out_path=str(out))
     assert result == str(out)
     assert out.is_file() and out.stat().st_size > 0
-    import wave
 
     with wave.open(str(out), "rb") as handle:
         assert handle.getnchannels() == 1
@@ -246,6 +303,7 @@ def test_local_synthesizer_reuses_the_cache(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@needs_ffmpeg
 def test_render_from_translated_gender_produces_a_valid_dub(tmp_path) -> None:
     video = make_video(tmp_path / "source.mp4", seconds=4.0)
     rows = make_rows()
@@ -274,14 +332,19 @@ def test_render_from_translated_gender_produces_a_valid_dub(tmp_path) -> None:
         (output.with_name(output.stem + ".render_report.json")).read_text(encoding="utf-8")
     )
     assert report["source_duration"] == pytest.approx(4.0)
+    assert report["output"] == str(output)
+    assert Path(report["output"]).exists()
     assert [segment["id"] for segment in report["segments"]] == ["s0", "s1"]
     assert report["segments"][0]["voice"] == "my-MM-ThihaNeural"
     assert report["segments"][1]["voice"] == "my-MM-NilarNeural"
 
 
-def test_render_never_changes_the_source_rows(tmp_path) -> None:
+@needs_ffmpeg
+def test_render_does_not_touch_the_source_media_or_the_rows(tmp_path) -> None:
+    """The source file stays byte-identical and the rows keep their identity."""
     video = make_video(tmp_path / "source.mp4", seconds=4.0)
     rows = make_rows()
+    before_bytes = video.read_bytes()
     before = [(r.row_id, r.start, r.duration, r.original) for r in rows]
     translation = write_translation(tmp_path / "translated_gender.json", rows)
     output = tmp_path / "final.mp4"
@@ -292,10 +355,54 @@ def test_render_never_changes_the_source_rows(tmp_path) -> None:
         settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
     )
     assert result.ok, result.message
-    after = [(r.row_id, r.start, r.duration, r.original) for r in rows]
-    assert after == before
+    assert [(r.row_id, r.start, r.duration, r.original) for r in rows] == before
+    assert video.read_bytes() == before_bytes
 
 
+@needs_ffmpeg
+def test_speech_is_placed_at_the_row_start(tmp_path) -> None:
+    """The mix must place the speech exactly at the locked row start."""
+    rows = [
+        ExactDubbingRow(row_id="s0", start=1.0, duration=1.0,
+                        original="Hello there.", burmese=BURMESE_A,
+                        gender=Gender.MALE),
+    ]
+    video = make_video(tmp_path / "source.mp4", seconds=3.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 3.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+
+    wav = extract_audio(output, tmp_path / "mix.wav")
+    first = first_sound_sample(wav)
+    assert first > 0, "the row starts at 1.0s, so the track must start silent"
+    assert abs(first - 1.0 * 44100) <= 4410  # within 100 ms
+
+
+@needs_ffmpeg
+def test_the_media_duration_wins_over_a_wrong_caller_duration(tmp_path) -> None:
+    """A stale duration must not silently shorten the output."""
+    video = make_video(tmp_path / "source.mp4", seconds=4.0)
+    rows = make_rows()
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 1.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts"), "total_duration": 1.0},
+    )
+    assert result.ok, result.message
+    duration = float(probe(output)["format"]["duration"])
+    assert abs(duration - 4.0) <= 0.1, "the output must follow the media, not the caller"
+
+
+@needs_ffmpeg
 def test_render_reuses_cached_speech(tmp_path) -> None:
     video = make_video(tmp_path / "source.mp4", seconds=4.0)
     rows = make_rows()
@@ -303,21 +410,46 @@ def test_render_reuses_cached_speech(tmp_path) -> None:
     service = ExactDubbingService(str(tmp_path / "jobs"))
     settings = {"tts_cache_dir": str(tmp_path / "jobs" / "tts")}
 
-    service.render_from_translated_gender(
+    first = service.render_from_translated_gender(
         str(translation), rows, str(video), 4.0, str(tmp_path / "a.mp4"),
         settings=settings,
     )
+    assert first.ok, first.message
     cache = list((tmp_path / "jobs" / "tts").glob("*.wav"))
     assert cache, "the synthesiser must leave cached audio behind"
     stamps = {path.stat().st_mtime_ns for path in cache}
 
-    service.render_from_translated_gender(
+    second = service.render_from_translated_gender(
         str(translation), rows, str(video), 4.0, str(tmp_path / "b.mp4"),
         settings=settings,
     )
+    assert second.ok, second.message
     assert {path.stat().st_mtime_ns for path in cache} == stamps
 
 
+@needs_ffmpeg
+def test_render_cleans_up_its_work_files(tmp_path) -> None:
+    """The mix scratch file and the fitted clips must not pile up."""
+    video = make_video(tmp_path / "source.mp4", seconds=4.0)
+    rows = make_rows()
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 4.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    leftovers = [
+        path for path in (tmp_path / "jobs").rglob("*")
+        if path.is_file() and (path.suffix == ".tmp" or path.name == "dubbed_audio.wav")
+    ]
+    assert leftovers == [], f"work files were left behind: {leftovers}"
+    assert list((tmp_path / "jobs").rglob("fitted")) == []
+
+
+@needs_ffmpeg
 def test_render_refuses_a_drifted_translation(tmp_path) -> None:
     video = make_video(tmp_path / "source.mp4", seconds=4.0)
     rows = make_rows()
@@ -340,7 +472,9 @@ def test_render_refuses_a_drifted_translation(tmp_path) -> None:
     assert not output.exists()
 
 
-def test_render_reports_failure_without_a_final_file(tmp_path) -> None:
+@needs_ffmpeg
+def test_a_failed_render_reports_the_reason_and_leaves_nothing_behind(tmp_path) -> None:
+    """A REAL failure keeps its reason and never leaves a success artefact."""
     rows = make_rows()
     translation = write_translation(tmp_path / "translated_gender.json", rows)
     output = tmp_path / "final.mp4"
@@ -351,7 +485,32 @@ def test_render_reports_failure_without_a_final_file(tmp_path) -> None:
         settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
     )
     assert not result.ok
+    assert "missing" in result.message.lower(), result.message
+    assert result.message != "Render failed", "the generic message hides the reason"
     assert not output.exists()
+    assert not output.with_name(output.stem + ".render_report.json").exists()
+
+
+@needs_ffmpeg
+def test_a_row_id_cannot_escape_the_job_folder(tmp_path) -> None:
+    """A row id from an artefact must never become a path."""
+    rows = [
+        ExactDubbingRow(row_id="../../escape", start=0.0, duration=1.0,
+                        original="Hello there.", burmese=BURMESE_A,
+                        gender=Gender.MALE),
+    ]
+    video = make_video(tmp_path / "source.mp4", seconds=2.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 2.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    assert not (tmp_path / "escape.wav").exists()
+    assert not (tmp_path.parent / "escape.wav").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -359,6 +518,79 @@ def test_render_reports_failure_without_a_final_file(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@needs_ffmpeg
+def test_the_ui_render_goes_through_the_exported_translation(tmp_path, qtbot) -> None:
+    """The product path must consume ``translated_gender.json`` and label itself."""
+    from PySide6.QtTest import QTest
+
+    from mmnext.domain.enums import AppMode
+    from mmnext.domain.models import ProjectSession, TranscriptRow, VideoSource
+    from mmnext.ui.app_context import AppContext
+
+    context = AppContext(jobs_dir=str(tmp_path / "jobs"))
+    try:
+        video = make_video(tmp_path / "source.mp4", seconds=4.0)
+        context.project.load(
+            ProjectSession(
+                source=VideoSource.local(str(video)),
+                output_folder=str(tmp_path),
+                mode=AppMode.EXACT_DUBBING,
+                is_demo=False,
+            )
+        )
+        context.project.apply_transcript(
+            [
+                TranscriptRow("s0", 0.0, 1.5, "Hello there."),
+                TranscriptRow("s1", 1.5, 1.5, "How are you?"),
+            ]
+        )
+        rows = context.prepare_exact_dubbing()
+        for index, row in enumerate(rows):
+            context.project.update_exact_row(
+                row.row_id,
+                burmese=BURMESE_A if index == 0 else BURMESE_B,
+                gender=Gender.MALE if index == 0 else Gender.FEMALE,
+            )
+
+        context.start_exact_dubbing_render(
+            video_path=str(video),
+            output_path=str(tmp_path / "final.mp4"),
+        )
+        # The exported translation file is the contract the render consumes.
+        exported = tmp_path / "jobs" / "exact_dubbing" / "translated_gender.json"
+        assert exported.is_file()
+        payload = json.loads(exported.read_text(encoding="utf-8"))
+        assert [entry["id"] for entry in payload] == [0, 1]
+
+        # The run is labelled honestly: DEMO while the speech is simulated.
+        service = ExactDubbingService(str(tmp_path / "jobs"))
+        expected = "REAL" if service.tts_available() else "DEMO"
+        assert context.exact_render_state == "running"
+        assert context.exact_render_message.startswith(expected)
+
+        waited = 0
+        while context.exact_render_state not in {"done", "failed"} and waited < 180000:
+            QTest.qWait(50)
+            waited += 50
+        assert context.exact_render_state == "done", context.exact_render_message
+        assert not context.exact_render_running, "the render worker did not finish"
+        assert (tmp_path / "final.mp4").is_file()
+        report = tmp_path / "final.render_report.json"
+        assert report.is_file()
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        assert payload["output"] == str(tmp_path / "final.mp4")
+        assert payload["is_demo"] is True
+    finally:
+        if context.exact_render_running:
+            context.stop_exact_dubbing_render()
+            waited = 0
+            while context.exact_render_running and waited < 60000:
+                QTest.qWait(50)
+                waited += 50
+        context.jobs.clear()
+
+
+@needs_ffmpeg
 def test_exported_translation_file_round_trips_into_a_render(tmp_path, qtbot) -> None:
     """The file the UI exports must be the file the renderer accepts."""
     from mmnext.domain.enums import AppMode

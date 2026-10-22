@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import os
 import subprocess
 from typing import Callable, Optional, Sequence
@@ -65,56 +66,79 @@ class ExactDubbingRenderCoordinator:
             sink(ProgressEvent(percent=percent, stage=stage, message=message))
 
     @staticmethod
-    def _audio_duration(path: Path) -> Optional[float]:
+    def _probe_json(path: Path, ffprobe: str = "ffprobe") -> Optional[dict]:
+        """Return the FFprobe document for ``path`` or ``None`` on failure."""
         try:
             completed = subprocess.run(
                 [
-                    "ffprobe",
+                    ffprobe,
                     "-v",
                     "error",
-                    "-show_entries",
-                    "format=duration",
+                    "-show_format",
+                    "-show_streams",
                     "-of",
-                    "default=noprint_wrappers=1:nokey=1",
+                    "json",
                     str(path),
                 ],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
                 check=False,
             )
-            value = completed.stdout.strip()
-            if value:
-                return float(value)
         except (OSError, ValueError, subprocess.SubprocessError):
             return None
+        if completed.returncode != 0:
+            return None
+        try:
+            data = json.loads(completed.stdout or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _audio_duration(cls, path: Path, ffprobe: str = "ffprobe") -> Optional[float]:
+        info = cls._probe_json(path, ffprobe)
+        if info is None:
+            return None
+        try:
+            value = info.get("format", {}).get("duration")
+            return float(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _audio_stream_duration(cls, path: Path, ffprobe: str = "ffprobe") -> Optional[float]:
+        """The audio stream's own duration, which is not the container's."""
+        info = cls._probe_json(path, ffprobe)
+        if info is None:
+            return None
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") != "audio":
+                continue
+            value = stream.get("duration")
+            if value in (None, "", "N/A"):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
         return None
 
-    @staticmethod
-    def _audio_stream_present(path: Path) -> bool:
-        """Whether the rendered file really contains an audio stream."""
-        try:
-            completed = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "a:0",
-                    "-show_entries",
-                    "stream=codec_type",
-                    "-of",
-                    "csv=p=0",
-                    str(path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return False
-        return "audio" in (completed.stdout or "")
+    @classmethod
+    def _audio_stream_present(cls, path: Path, ffprobe: str = "ffprobe") -> Optional[bool]:
+        """Whether the rendered file has an audio stream.
+
+        ``None`` means the probe itself failed, which is different from "the
+        file has no audio stream" and must not be reported as the latter.
+        """
+        info = cls._probe_json(path, ffprobe)
+        if info is None:
+            return None
+        return any(
+            stream.get("codec_type") == "audio" for stream in info.get("streams", [])
+        )
 
     def run(
         self,
@@ -136,6 +160,7 @@ class ExactDubbingRenderCoordinator:
         warnings: list[str] = []
         voice_default = str(settings.get("voice", "my-MM-NilarNeural"))
         base_rate = float(settings.get("rate", 1.0))
+        ffprobe = str(settings.get("ffprobe") or "ffprobe")
         cache_dir = Path(settings.get("tts_cache_dir") or Path(output_path).parent / "exact_dubbing_tts")
         cache_dir.mkdir(parents=True, exist_ok=True)
         audio_paths: dict[str, str] = {}
@@ -154,7 +179,10 @@ class ExactDubbingRenderCoordinator:
                     )
                 voice = row.voice or voice_default
                 key = self.tts.cache_key(row.burmese, voice, base_rate)
-                audio_path = cache_dir / f"{row.row_id}_{key[:16]}.wav"
+                # The file name is built from the positional index, never from
+                # the row id: a row id comes from an artefact and could contain
+                # path separators.  The legacy pipeline used the same scheme.
+                audio_path = cache_dir / f"{index:04d}_{key[:16]}.wav"
                 result_path = self.tts.synthesize_segment(
                     row.burmese, voice=voice, rate=base_rate, out_path=str(audio_path)
                 )
@@ -168,7 +196,7 @@ class ExactDubbingRenderCoordinator:
                 # a pitch-preserving ``atempo`` chain.  The row's own timing is
                 # never touched, so no re-synthesis at a different rate is
                 # needed here.
-                measured = self._audio_duration(Path(result_path))
+                measured = self._audio_duration(Path(result_path), ffprobe)
                 if measured is not None and row.duration > 0 and measured > row.duration * 1.35:
                     warnings.append(
                         f"{row.row_id}: speech is {measured / row.duration:.2f}x the source "
@@ -199,10 +227,7 @@ class ExactDubbingRenderCoordinator:
         self._emit(sink, 60.0, Stage.RENDER, "Rendering exact dubbing")
         render_settings = dict(settings)
         render_settings["audio_paths"] = audio_paths
-        # The render report is written next to the *published* output.
-        render_settings["report_path"] = str(
-            Path(output_path).with_name(Path(output_path).stem + ".render_report.json")
-        )
+        render_settings["ffprobe"] = ffprobe
         partial_output = partial_path_for(output_path)
         Path(partial_output).parent.mkdir(parents=True, exist_ok=True)
         rendered = self.renderer.render(video_path, rows, str(partial_output), render_settings)
@@ -219,25 +244,75 @@ class ExactDubbingRenderCoordinator:
                 rendered = False
                 message = "Rendered output is missing or empty"
             else:
-                measured_duration = self._audio_duration(partial_output)
-                if measured_duration is not None and video_duration > 0:
-                    tolerance = float(settings.get("duration_tolerance", 0.25))
-                    if abs(measured_duration - video_duration) > tolerance:
-                        rendered = False
-                        message = f"Output duration {measured_duration:.3f}s differs from source {video_duration:.3f}s"
-                if rendered and not self._audio_stream_present(partial_output):
+                # The *media* duration is authoritative.  The duration the
+                # caller reported is only used to report a source change, so a
+                # stale number can never shorten the output and then be used
+                # to validate that shortened output.
+                source_duration = self._audio_duration(Path(video_path), ffprobe)
+                expected = source_duration or video_duration
+                tolerance = float(settings.get("duration_tolerance", 0.25))
+                measured_duration = self._audio_duration(partial_output, ffprobe)
+                if measured_duration is None:
                     rendered = False
-                    message = "Rendered output has no audio stream"
+                    message = "Rendered output could not be probed"
+                elif expected > 0 and abs(measured_duration - expected) > tolerance:
+                    rendered = False
+                    message = (
+                        f"Output duration {measured_duration:.3f}s differs from "
+                        f"source {expected:.3f}s"
+                    )
+                if rendered:
+                    has_audio = self._audio_stream_present(partial_output, ffprobe)
+                    if has_audio is None:
+                        rendered = False
+                        message = "Rendered output could not be probed for audio streams"
+                    elif not has_audio:
+                        rendered = False
+                        message = "Rendered output has no audio stream"
+                if rendered:
+                    audio_duration = self._audio_stream_duration(partial_output, ffprobe)
+                    if audio_duration is not None and expected > 0:
+                        audio_tolerance = max(float(settings.get("audio_tolerance", 0.5)), tolerance)
+                        if abs(audio_duration - expected) > audio_tolerance:
+                            rendered = False
+                            message = (
+                                f"Output audio stream is {audio_duration:.3f}s but the "
+                                f"source is {expected:.3f}s"
+                            )
                 if rendered:
                     os.replace(partial_output, output_path)
                     message = "Render complete"
+                    self._write_render_report(output_path, video_duration)
         else:
-            message = "Render failed"
+            # A REAL failure must carry its reason, not a generic message.
+            reason = str(getattr(self.renderer, "error", "") or "").strip()
+            message = f"Render failed: {reason}" if reason else "Render failed"
         self._emit(sink, 100.0, Stage.RENDER, message)
         return ExactDubbingRenderResult(
             is_demo=self.is_demo,
             ok=bool(rendered),
             output_path=output_path if rendered else "",
             warnings=warnings,
-            message=message if rendered else ("Render failed" if not rendered else message),
+            message=message,
         )
+
+    def _write_render_report(self, output_path: str, video_duration: float) -> None:
+        """Write the render report next to the *published* output.
+
+        The report is written only after the output passed every gate, so a
+        failed run never leaves a success-looking report behind.
+        """
+        report = dict(getattr(self.renderer, "report", {}) or {})
+        if not report:
+            return
+        final = Path(output_path)
+        report["output"] = str(final)
+        report["source_duration"] = report.get("source_duration") or video_duration
+        report["is_demo"] = bool(self.is_demo)
+        path = final.with_name(final.stem + ".render_report.json")
+        try:
+            path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as exc:  # pragma: no cover - disk failure
+            self.log(f"Could not write the render report: {exc}")

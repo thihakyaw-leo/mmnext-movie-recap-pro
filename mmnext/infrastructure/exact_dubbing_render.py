@@ -6,18 +6,26 @@ contract.  It does not use moviepy and it never edits the legacy project.
 The chain is:
 
 1. **Fit** - every row's speech is squeezed into its *locked* window with a
-   pitch-preserving FFmpeg ``atempo`` chain.  A second correction pass runs
-   when FFmpeg's sample-window rounding leaves the clip longer than the
-   window.  The source row's ``start``/``duration`` are never changed: the
-   speech is fitted to the row, not the row to the speech.
+   pitch-preserving FFmpeg ``atempo`` chain.  The sped clip is measured and,
+   when FFmpeg's sample-window rounding leaves it longer than the window, a
+   second correction pass re-encodes it at a corrected ratio so that the
+   words fit instead of being cut off.  The source row's ``start``/``duration``
+   are never changed: the speech is fitted to the row, not the row to the
+   speech.
 2. **Mix** - the fitted clips are placed on an exact 44100 Hz timeline.  The
    mix is written through a bounded ``numpy`` memmap so a long movie does not
    need the whole timeline in RAM, and the areas without speech stay silent.
 3. **Mux** - the untouched source video is muxed with the mixed track.  Every
    video frame and the original duration are preserved.
-4. **Validate** - FFprobe must find an audio stream and a duration that
-   matches the source.  Only then is the ``.partial`` output renamed into
-   place; a failed validation leaves no final file behind.
+4. **Validate** - FFprobe must find a video stream, an audio stream whose own
+   duration matches the source, and a container duration that matches the
+   source.  Only then is the ``.partial`` output renamed into place; a failed
+   validation leaves no final file behind.
+
+The **media duration is always taken from the probed source**, never from a
+caller-supplied number: a stale or truncated duration would otherwise produce
+a silently shortened output that passes every check because the same wrong
+number is used for the mix, the mux and the validation.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import math
 import os
 import shutil
 import subprocess
+import time
 import wave
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -34,6 +43,15 @@ from typing import Callable, Optional, Sequence
 from ..domain.exact_dubbing import atempo_chain, speech_window
 from ..domain.models import ExactDubbingRow
 from ..services.protocols import ExactDubbingRenderer
+
+try:  # numpy is an optional dependency; the mix needs it.
+    # It is imported here, once, on purpose: importing numpy for the first
+    # time from two threads at the same time can deadlock the interpreter, and
+    # the mix always runs on a worker thread.  Importing it while this module
+    # is loaded keeps that import on the thread that loads the module.
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency
+    np = None  # type: ignore[assignment]
 
 __all__ = ["FfmpegExactDubbingRenderer", "RenderValidationError"]
 
@@ -46,6 +64,17 @@ FIT_TOLERANCE = 0.04
 
 #: Warning threshold for the speed fit.  It is a warning, never a cap.
 SPEED_WARNING_RATIO = 1.35
+
+#: How far the caller's duration may differ from the probed media before it is
+#: reported as a source change.
+SOURCE_DURATION_TOLERANCE = 0.5
+
+#: Default subprocess timeout for one FFmpeg/FFprobe call.
+DEFAULT_TIMEOUT_S = 1800
+
+#: Tolerance for the final audio-stream duration check.  AAC adds a little
+#: encoder padding, so the check is looser than the container check.
+AUDIO_STREAM_TOLERANCE = 0.5
 
 
 class RenderValidationError(RuntimeError):
@@ -61,12 +90,20 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         ffprobe: str = "ffprobe",
         log: Optional[Callable[[str], None]] = None,
         work_dir: Optional[str] = None,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
     ) -> None:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.log = log or (lambda msg: None)
         self.work_dir = Path(work_dir) if work_dir else None
+        self.timeout_s = int(timeout_s)
         self._stage = "idle"
+        #: The reason of the last failure.  The coordinator reports it so a
+        #: REAL failure is never reduced to a generic "Render failed".
+        self.error: str = ""
+        #: The details of the last successful render.  The coordinator writes
+        #: the report *after* it published the final file.
+        self.report: dict = {}
 
     # -- capability --------------------------------------------------------- #
     def available(self) -> bool:
@@ -77,21 +114,37 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         return {"stage": self._stage, "percent": 0.0}
 
     # -- FFmpeg helpers ----------------------------------------------------- #
-    def _run(self, command: Sequence[str]) -> None:
-        completed = subprocess.run(
-            list(command),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    def _run(self, command: Sequence[str], timeout: Optional[int] = None) -> str:
+        """Run a tool and return its stdout.  Raises on a non-zero exit."""
+        started = time.perf_counter()
+        name = Path(command[0]).name
+        self.log(f"run: {name}")
+        try:
+            completed = subprocess.run(
+                list(command),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout or self.timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"{name} timed out after {timeout or self.timeout_s}s"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"{name} could not be started: {exc}") from exc
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip()
             raise RuntimeError(
-                f"{Path(command[0]).name} failed ({completed.returncode}): {detail[-800:]}"
+                f"{name} failed ({completed.returncode}): {detail[-800:]}"
             )
+        self.log(f"done: {name} in {time.perf_counter() - started:.2f}s")
+        return completed.stdout or ""
 
     def _probe(self, path: str | Path) -> dict:
-        completed = subprocess.run(
+        payload = self._run(
             [
                 self.ffprobe,
                 "-v",
@@ -102,17 +155,15 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                 "json",
                 str(path),
             ],
-            capture_output=True,
-            text=True,
-            check=False,
+            timeout=120,
         )
-        if completed.returncode != 0:
-            detail = (completed.stderr or "").strip()
-            raise RuntimeError(f"ffprobe failed for {path}: {detail[-400:]}")
         try:
-            return json.loads(completed.stdout or "{}")
+            data = json.loads(payload or "{}")
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"ffprobe returned unreadable JSON for {path}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"ffprobe returned an unexpected document for {path}")
+        return data
 
     @staticmethod
     def _duration(info: dict) -> float:
@@ -122,9 +173,31 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
             return 0.0
 
     @staticmethod
+    def _stream_duration(info: dict, codec_type: str) -> float:
+        """Return the duration of the first stream of ``codec_type``."""
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") != codec_type:
+                continue
+            for key in ("duration", "duration_ts"):
+                value = stream.get(key)
+                if value in (None, "", "N/A"):
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @staticmethod
     def _has_audio_stream(info: dict) -> bool:
         return any(
             stream.get("codec_type") == "audio" for stream in info.get("streams", [])
+        )
+
+    @staticmethod
+    def _has_video_stream(info: dict) -> bool:
+        return any(
+            stream.get("codec_type") == "video" for stream in info.get("streams", [])
         )
 
     @staticmethod
@@ -152,80 +225,82 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         ratio: float,
         destination: Path,
     ) -> Path:
-        """Fit ``raw_audio`` into ``target`` seconds and return the result."""
+        """Fit ``raw_audio`` into ``target`` seconds and return the result.
+
+        The sped clip is produced *without* a duration limit so it can be
+        measured.  When FFmpeg's rounding leaves it longer than the window, a
+        correction pass re-encodes it at the corrected ratio, which is what
+        keeps the words inside the slot instead of cutting them off.
+        """
         destination.parent.mkdir(parents=True, exist_ok=True)
         if ratio <= 1.0:
             # The speech is short enough: only trim it to the window.
             self._run(
                 [
-                    self.ffmpeg,
-                    "-v",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(raw_audio),
-                    "-ar",
-                    str(MIX_SAMPLE_RATE),
-                    "-ac",
-                    "1",
-                    "-t",
-                    f"{target:.6f}",
+                    self.ffmpeg, "-v", "error", "-y",
+                    "-i", str(raw_audio),
+                    "-ar", str(MIX_SAMPLE_RATE), "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    "-t", f"{target:.6f}",
                     str(destination),
                 ]
             )
             return destination
 
-        chain = atempo_chain(ratio)
+        produced = destination.with_name(destination.stem + "_sped.wav")
         self._run(
             [
-                self.ffmpeg,
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(raw_audio),
-                "-af",
-                chain,
-                "-ar",
-                str(MIX_SAMPLE_RATE),
-                "-ac",
-                "1",
-                "-t",
-                f"{target:.6f}",
+                self.ffmpeg, "-v", "error", "-y",
+                "-i", str(raw_audio),
+                "-af", atempo_chain(ratio),
+                "-ar", str(MIX_SAMPLE_RATE), "-ac", "1",
+                "-c:a", "pcm_s16le",
+                str(produced),
+            ]
+        )
+        measured = self._duration(self._probe(produced))
+        if measured > target + FIT_TOLERANCE:
+            corrected = ratio * (measured / target) * 1.01
+            self._run(
+                [
+                    self.ffmpeg, "-v", "error", "-y",
+                    "-i", str(raw_audio),
+                    "-af", atempo_chain(corrected),
+                    "-ar", str(MIX_SAMPLE_RATE), "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    str(produced),
+                ]
+            )
+            measured = self._duration(self._probe(produced))
+            if measured > target + FIT_TOLERANCE:
+                # Even the corrected ratio does not fit; cut at the window and
+                # say so, because a silent truncation must never be silent.
+                self.log(
+                    f"[Speed warning] the corrected fit is still {measured - target:.3f}s "
+                    "too long; the tail is cut at the window edge."
+                )
+        # Trim to the window.  This is the hard cut at the slot edge and it
+        # only removes what the fit could not compress.
+        self._run(
+            [
+                self.ffmpeg, "-v", "error", "-y",
+                "-i", str(produced),
+                "-ar", str(MIX_SAMPLE_RATE), "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-t", f"{target:.6f}",
                 str(destination),
             ]
         )
-        produced = self._duration(self._probe(destination))
-        if produced > target + FIT_TOLERANCE:
-            # FFmpeg rounds the atempo window; correct it and add 1 % margin.
-            corrected = ratio * (produced / target) * 1.01
-            self._run(
-                [
-                    self.ffmpeg,
-                    "-v",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(raw_audio),
-                    "-af",
-                    atempo_chain(corrected),
-                    "-ar",
-                    str(MIX_SAMPLE_RATE),
-                    "-ac",
-                    "1",
-                    "-t",
-                    f"{target:.6f}",
-                    str(destination),
-                ]
-            )
         return destination
 
     # -- mixing ------------------------------------------------------------- #
     @staticmethod
-    def _read_wav_mono(path: Path) -> "object":
-        """Read a mono PCM WAV into a numpy float64 array in ``[-1, 1]``."""
-        import numpy as np
-
+    def _read_wav_mono(path: Path):
+        """Read a mono PCM WAV into a numpy float32 array in ``[-1, 1]``."""
+        if np is None:  # pragma: no cover - optional dependency
+            raise RenderValidationError(
+                "NumPy is required for the exact-dubbing mix; install it and retry."
+            )
         with wave.open(str(path), "rb") as handle:
             if handle.getnchannels() != 1:
                 raise RenderValidationError(
@@ -239,10 +314,8 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                 raise RenderValidationError(
                     f"Fitted clip {path.name} is not {MIX_SAMPLE_RATE} Hz"
                 )
-            frames = handle.getnframes()
-            raw = handle.readframes(frames)
-        samples = np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32768.0
-        return samples
+            raw = handle.readframes(handle.getnframes())
+        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
     def _mix(
         self,
@@ -252,11 +325,14 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         scratch: Path,
     ) -> None:
         """Place every fitted clip on an exact 44100 Hz timeline."""
-        import numpy as np
-
+        if np is None:  # pragma: no cover - optional dependency
+            raise RenderValidationError(
+                "NumPy is required for the exact-dubbing mix; install it and retry."
+            )
         frames = max(1, int(math.ceil(total * MIX_SAMPLE_RATE)))
         scratch.parent.mkdir(parents=True, exist_ok=True)
-        mix = np.memmap(str(scratch), dtype="float64", mode="w+", shape=(frames,))
+        self.log(f"Mix: opening a {total:.3f}s timeline at {MIX_SAMPLE_RATE} Hz")
+        mix = np.memmap(str(scratch), dtype="float32", mode="w+", shape=(frames,))
         try:
             mix[:] = 0.0
             for start, clip in placements:
@@ -268,6 +344,7 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                     continue
                 count = min(samples.size, frames - begin)
                 mix[begin:begin + count] += samples[:count]
+            self.log(f"Mix: placed {len(placements)} clips, writing the track")
             destination.parent.mkdir(parents=True, exist_ok=True)
             with wave.open(str(destination), "wb") as handle:
                 handle.setnchannels(1)
@@ -275,12 +352,25 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                 handle.setframerate(MIX_SAMPLE_RATE)
                 chunk = 65536
                 for offset in range(0, frames, chunk):
-                    block = np.asarray(mix[offset:offset + chunk])
+                    block = np.array(mix[offset:offset + chunk], copy=True)
                     clipped = np.clip(block, -1.0, 1.0)
                     handle.writeframesraw(
                         (clipped * 32767.0).astype("<i2").tobytes()
                     )
         finally:
+            # The mapping has to be closed explicitly: on Windows an open
+            # mapping keeps the scratch file locked and it would never be
+            # deleted.
+            try:
+                mix.flush()
+            except (OSError, ValueError):
+                pass
+            mapping = getattr(mix, "_mmap", None)
+            if mapping is not None:
+                try:
+                    mapping.close()
+                except (OSError, BufferError, ValueError):
+                    pass
             del mix
             try:
                 scratch.unlink()
@@ -296,24 +386,14 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         destination: Path,
     ) -> str:
         common = [
-            self.ffmpeg,
-            "-v",
-            "error",
-            "-y",
-            "-i",
-            str(video_path),
-            "-i",
-            str(audio_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-t",
-            f"{total:.9f}",
-            "-c:a",
-            "aac",
-            "-pix_fmt",
-            "yuv420p",
+            self.ffmpeg, "-v", "error", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-t", f"{total:.9f}",
+            "-c:a", "aac",
+            "-pix_fmt", "yuv420p",
         ]
         destination.parent.mkdir(parents=True, exist_ok=True)
         attempts = (
@@ -323,13 +403,14 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         last_error = ""
         for extra in attempts:
             command = common + extra + ["-movflags", "+faststart", str(destination)]
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
-            if completed.returncode == 0:
-                codec = extra[1]
-                self.log(f"Exact dubbing muxed with {codec}")
-                return codec
-            last_error = (completed.stderr or completed.stdout or "").strip()
-            self.log(f"GPU export unavailable ({last_error[-200:]}); falling back to CPU")
+            try:
+                self._run(command)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                self.log(f"GPU export unavailable ({last_error[-200:]}); falling back to CPU")
+                continue
+            self.log(f"Exact dubbing muxed with {extra[1]}")
+            return extra[1]
         raise RuntimeError(f"FFmpeg mux failed: {last_error[-800:]}")
 
     # -- protocol ----------------------------------------------------------- #
@@ -344,28 +425,51 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         settings = dict(settings or {})
         audio_paths: dict[str, str] = dict(settings.get("audio_paths") or {})
         self._stage = "render"
+        self.error = ""
+        self.report = {}
+        fitted_dir: Optional[Path] = None
+        audio_out: Optional[Path] = None
+        scratch: Optional[Path] = None
         try:
             if not self.available():
-                self.log("FFmpeg/FFprobe are unavailable; no video was rendered")
+                self.error = "FFmpeg/FFprobe are unavailable; no video was rendered"
+                self.log(self.error)
                 return False
             if not rows:
-                self.log("No exact-dubbing rows to render")
+                self.error = "No exact-dubbing rows to render"
+                self.log(self.error)
                 return False
             missing = [row.row_id for row in rows if row.row_id not in audio_paths]
             if missing:
-                self.log(f"No synthesised audio for rows: {', '.join(missing[:5])}")
+                self.error = f"No synthesised audio for rows: {', '.join(missing[:5])}"
+                self.log(self.error)
                 return False
 
             source = Path(video_path)
             if not source.is_file():
-                self.log(f"Source video is missing: {source}")
+                self.error = f"Source video is missing: {source}"
+                self.log(self.error)
                 return False
 
             probe = self._probe(source)
-            total = float(settings.get("total_duration") or self._duration(probe))
+            # The probed media duration is authoritative.  A caller-supplied
+            # duration is only used to report a source change.
+            total = self._duration(probe)
             if total <= 0:
-                self.log("Source video has no usable duration")
+                self.error = "Source video has no usable duration"
+                self.log(self.error)
                 return False
+            claimed = settings.get("total_duration")
+            if claimed:
+                try:
+                    claimed_f = float(claimed)
+                except (TypeError, ValueError):
+                    claimed_f = 0.0
+                if claimed_f > 0 and abs(claimed_f - total) > SOURCE_DURATION_TOLERANCE:
+                    self.log(
+                        f"[Source warning] the caller reported {claimed_f:.3f}s but the "
+                        f"media is {total:.3f}s; the media duration is used."
+                    )
             fps = self._frame_rate(probe)
 
             destination = Path(output_path)
@@ -373,6 +477,8 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
             work.mkdir(parents=True, exist_ok=True)
             fitted_dir = work / "fitted"
             fitted_dir.mkdir(parents=True, exist_ok=True)
+            audio_out = work / "dubbed_audio.wav"
+            scratch = work / "dubbed_mix.float32.tmp"
 
             # -- fit every row into its locked window ------------------------ #
             placements: list[tuple[float, Path]] = []
@@ -380,20 +486,19 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
             for index, row in enumerate(rows):
                 raw = Path(audio_paths[row.row_id])
                 if not raw.is_file():
-                    self.log(f"Synthesised audio is missing for {row.row_id}")
+                    self.error = f"Synthesised audio is missing for {row.row_id}"
+                    self.log(self.error)
                     return False
-                next_start = (
-                    rows[index + 1].start if index + 1 < len(rows) else None
-                )
+                next_start = rows[index + 1].start if index + 1 < len(rows) else None
                 target = speech_window(row.start, row.duration, next_start, total)
                 if target <= 0:
-                    self.log(f"Row {row.row_id} has no usable speech window")
+                    self.error = f"Row {row.row_id} has no usable speech window"
+                    self.log(self.error)
                     return False
-                raw_info = self._probe(raw)
-                raw_duration = self._duration(raw_info)
+                raw_duration = self._duration(self._probe(raw))
                 ratio = raw_duration / target if target > 0 else 1.0
                 fitted = self._fit_row(
-                    raw, target, ratio, fitted_dir / f"{row.row_id}_fitted.wav"
+                    raw, target, ratio, fitted_dir / f"{index:04d}_fitted.wav"
                 )
                 if ratio > SPEED_WARNING_RATIO:
                     self.log(
@@ -415,8 +520,7 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
 
             # -- mix ------------------------------------------------------------ #
             self.log("Exact dubbing: mixing the dubbed audio")
-            audio_out = work / "dubbed_audio.wav"
-            self._mix(placements, total, audio_out, work / "dubbed_mix.float64.tmp")
+            self._mix(placements, total, audio_out, scratch)
 
             # -- mux ------------------------------------------------------------ #
             self.log("Exact dubbing: muxing the dubbed video")
@@ -431,37 +535,46 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                 raise RenderValidationError(
                     f"Output duration mismatch: source={total:.3f}s, output={measured:.3f}s"
                 )
-            if not self._has_audio_stream(info):
-                raise RenderValidationError("Output audio stream is missing.")
             if not self._has_video_stream(info):
                 raise RenderValidationError("Output video stream is missing.")
+            if not self._has_audio_stream(info):
+                raise RenderValidationError("Output audio stream is missing.")
+            audio_duration = self._stream_duration(info, "audio")
+            if audio_duration > 0:
+                audio_tolerance = max(AUDIO_STREAM_TOLERANCE, tolerance)
+                if abs(audio_duration - total) > audio_tolerance:
+                    raise RenderValidationError(
+                        f"Output audio stream duration {audio_duration:.3f}s differs "
+                        f"from source {total:.3f}s"
+                    )
 
             os.replace(partial, destination)
-            report = {
+            self.report = {
                 "source_duration": total,
                 "output_duration": measured,
+                "audio_duration": audio_duration,
                 "encoder": codec,
                 "segments": details,
-                "output": str(destination),
             }
-            report_path = Path(
-                settings.get("report_path")
-                or destination.with_name(destination.stem + ".render_report.json")
-            )
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(
-                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
             self.log(f"Exact dubbing render complete: {destination}")
             return True
         except Exception as exc:  # noqa: BLE001 - reported to the UI
+            self.error = str(exc)
             self.log(f"Exact dubbing render failed: {exc}")
             return False
         finally:
             self._stage = "idle"
-
-    @staticmethod
-    def _has_video_stream(info: dict) -> bool:
-        return any(
-            stream.get("codec_type") == "video" for stream in info.get("streams", [])
-        )
+            # Per-run artefacts must not pile up: the mix, the fitted clips
+            # and the mixed track are all reproducible from the cache.
+            if fitted_dir is not None:
+                shutil.rmtree(fitted_dir, ignore_errors=True)
+            if audio_out is not None:
+                try:
+                    audio_out.unlink()
+                except OSError:
+                    pass
+            if scratch is not None:
+                try:
+                    scratch.unlink()
+                except OSError:
+                    pass

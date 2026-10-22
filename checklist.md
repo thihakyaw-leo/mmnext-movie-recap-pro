@@ -1081,13 +1081,35 @@ Next action: reject/report model timestamps outside authoritative media duration
 - `mmnext/application/exact_dubbing_service.py` (**အသစ်**) — application facade။ UI က infrastructure ကို တိုက်ရိုက် မလုပ်ရ။ `render_from_translated_gender()` က `translated_gender.json` ကို အရင် သိမ်းပြီး source rows နဲ့ တိကျစစ်ပြီးမှ render စတင်ပါတယ်။
 - `mmnext/application/exact_dubbing_render_coordinator.py` — rate နဲ့ re-synthesis ကို ဖယ်ရှားပြီး (fit ကို renderer ရဲ့ `atempo` က လုပ်သဖြင့်) final validation မှာ **audio-stream check** ထည့်ခဲ့ပါတယ်။
 - `mmnext/ui/app_context.py` — `ExactDubbingService` facade ကို သုံးရင်း renderer/TTS ကို ရွေးပါတယ်။ `export_exact_dubbing()` က အခု legacy-compatible ဖြစ်အောင် `id` က **positional int index** ဖြစ်ပြီး source row id ကို အပိုးအပိုး `row_id` key အဖြစ် ထည့်ပါတယ် (legacy reader အပိုးအပိုး key ကို လက်ခံပါတယ်)။
-- `tests/test_exact_dubbing_render.py` (**အသစ်**, 20 tests) — domain schema/validation, cache, နဲ့ **real FFmpeg render** (video ထုတ် → WAV synthesize → fit → mix → mux → ffprobe validate)။
+- `tests/test_exact_dubbing_render.py` (**အသစ်**, 29 tests) — domain schema/validation, cache, နဲ့ **real FFmpeg render** (video ထုတ် → WAV synthesize → fit → mix → mux → ffprobe validate)။ FFmpeg မရှိတဲ့ machine မှာ pure-domain test တွေကိုလည်း ဆက်လက် run ဖြစ်အောင် `skipif` ကို FFmpeg-dependent test တွေမှာသာ သုံးပါတယ်။
+
+### Code-review fix cycle — Exact Dubbing slice (2026-10-22)
+
+Independent review က exact-dubbing slice ကို စစ်ဆေးပြီး ရလဒ်တိုင်းကို source နဲ့ run ပြီး အတည်ပြပြီး ပြင်ဆင်ပါတယ်။
+
+- [x] **CRITICAL — renderer/TTS diagnostic အားလုံး ပျောက်နေခဲ့သည်။** `create_coordinator()` က log callback မပေးတာကြောင့် `"Render failed"` ပဲ ပေါ်ပြီး `"FFmpeg mux failed: …"`၊ `"Output duration mismatch: …"` တို့ မမြင်ရဘူး။ အခု log callback က synthesiser/renderer/coordinator အားလုံးမှာ ပေးပြီး၊ failure ရင် renderer ရဲ့ `error` က coordinator result message ထဲမှာ အမှန်တကယ် အကြောင်းရင်းအမြစ် ပါပေါ်ပါတယ်။
+- [x] **CRITICAL — UI က ပေးခဲ့သော duration က media duration ကို အစားထိုးနေခဲ့သည်။** Probed media duration ကသာ authoritative ဖြစ်ပြီး၊ caller က ပေးသော duration က ချိန်ချင်းမှာ source ပြောင်းသွားသော warning သာ ဖြစ်ပါတယ်။ ရင်းသားအတိုင်း output က တိုက်ရိုက် တိုးပြီး validation ကလည်း အဲဒီ ပိုးငွေနဲ့တူ ပြောင်းလဲသွားပါတယ်။
+- [x] **CRITICAL (product bug) — numpy ရဲ့ concurrent import က UI render ကို deadlock လုပ်ခဲ့သည်။** `import numpy` က function အတွင်း lazy ဆိုရှားလို့ **worker thread ပထမအကြိမ်** import လုပ်ရာမှာ interpreter ကြန့်နေပါတယ် — main thread ကမှ မလုပ်ရဘူး။ numpy ကို အခု module အဆင်း တစ်ခါတည်း (loading thread ပေါ်ပဲ) import လုပ်ပြီး၊ optional dependency မရှိရင် clear error ပြပါတယ်။ **UI path ကို တိုက်ရိုက် run လုပ်တဲ့ test မရှိလို့ ဒီ defect က မဖမ်းမိခဲ့ပါ** — အခု `test_the_ui_render_goes_through_the_exported_translation` က ကားတားတယ်။
+- [x] **Atempo correction pass က dead code ဖြစ်နေခဲ့သည်။** atempo branch က `-t` နဲ့ limit ထားသဖြင့် produced length က အတိအကျ target ဖြစ်ပြီး correction pass က မရောက်ခဲ့ပါ။ အခု `-t` ကို ဖြတ်ပြီး produced length ကို တိုင်းတား၊ legacy algorithm အတိုင်း corrected ratio နဲ့ ပြန် encode ပြီးမှ window ထဲ ချောင်းတဲ့ အစွန်းကို ဖြတ်ပါတယ်။
+- [x] **Mix scratch file က Windows မှာ ဖျက်ခြင်း မဖြစ်ခဲ့ပါ။** memmap mapping ကို အတိအကျ close လုပ်ပြီးမှ scratch file က ဖျက်ပါတယ် (float32 + explicit close)။ fitted clips နဲ့ `dubbed_audio.wav` ကလည်း run ပြီးမှ ဖျက်ပါတယ်။
+- [x] **Render report က publish မလုပ်ခင် ရေးပြီး output path က မရှိတဲ့ partial ကို ညွှန်းနေခဲ့သည်။** အခု report ကို coordinator က output ကို publish ပြီးမှ ရေးပါတယ်၊ `output` က final path ဖြစ်ပါတယ်။ ရှေ့သွားသော run က "success" လို့ ပုံစံ report မကျန်တော့ပါ။
+- [x] **Final validation က audio stream ရဲ့ ကိုယ်ပိုင် duration ကို မစစ်ခဲ့ပါ။** ယခု container duration အပြင် audio stream duration ကိုလည်း စစ်ပါတယ် — ခုလိုင်မြင်နေသော/လုံးဝ အသံမဲ့ audio track ကို ငြင်းပါတယ်။
+- [x] **Coordinator က `"ffprobe"` ကို hard-code ထားခဲ့သည်။** ffprobe path ကို settings မှာ ပို့ပြီး probe မအောင်မြင်ခြင်းနဲ့ "audio stream မရှိတော့" ကို မှားပြောင်းတာ ဖြေပြပြီး ခွဲခြားပါတယ်။
+- [x] **BOM ပါတဲ့/မရှင်တဲ့ translation file က "not found" လို့ ပြောခဲ့သည်။** `utf-8-sig` နဲ့ ဖတ်ပြီး၊ missing နဲ့ unreadable ကို သီးသန့် အမှတ်ပြုပါတယ်။
+- [x] **`row_id` က file name အဖြစ် သုံးခဲ့သည်။** artefact ကနေလာသော row id က path separator ပါနိုင်လို့ **positional index** ကိုသာ သုံးပါတယ် (legacy အတူ)။
+- [x] **subprocess decode/timeout မရှိခဲ့သည်။** အားလုံး `encoding="utf-8", errors="replace"` + timeout ပါဝင်ပြီး၊ timeout ဖြစ်ရင် အမှန်တကယ် message ပေါ်ပါတယ်။
+- [x] **DEMO session က REAL အဖြစ် အမှတ်ပြုခဲ့သည်။** အခု `session.is_demo or coordinator.is_demo` ကို သုံးပါတယ်။ ထပ်မံတွေ့ကားတဲ့ bug — demo synthesiser က အသုံးပြုပြီးပါက `available()` က **True** ဖြစ်တာကြောင့် availability ကို fallback မလုပ်ခင် ဖတ်ပါတယ်။
+- [x] **Speed warning က user မရောက်ခဲ့ပါ။** `result.warnings` ကို log drawer ထဲ ပို့ပါတယ်။
+- [x] **UI product path က `translated_gender.json` ကို မသုံးခဲ့ပါ။** အခု render က exported file ကို validate ပြီးမှ စတင်ပါတယ် — ဒါက test-only path မဟုတ်တော့ပါ။
+- [x] **တချို့ minor item** — `EXACT_DUB_VOICES` ကို `Gender.voice` ကနေ ရယူပြီး (mapping တစ်ခုတည်း)၊ မလိုအပ်တဲ့ helper နှစ်ခု ဖယ်ရှားပြီး၊ numpy ကို dependency chip ထဲ ထည့်ပြီး၊ WAV ကို တစ်ခါတည်း buffer နဲ့ ရေးပြီး၊ stop message ကို မှန်တကယ်အတိအကျ ဖြစ်အောင် ပြင်ပြီး၊ schema docstring ကို implementation နဲ့ တူညီအောင် ပြင်ပါတယ်။
+- [x] **မမှန်တကယ် မလုပ်ရသေးသော အချက်** — review မှာ မှတ်ထားခဲ့သော Edge TTS retry ladder က တစ် row အတွက် ၁၃၅ စက္ကန့် ရပ်တန့်နိုင်သော်လည်း (legacy အတူ)၊ coordinator က ပထမဆုံး မအောင်မြင်သော row မှာ ရပ်ပါတယ်။ မှတ်ထားခဲ့သော အချက်အလက် မှာ အမှန်တကယ် မဟုတ်။
+- [x] **မမှန်တကယ် မလုပ်ရသေးသော အချက်** — mix က source soundtrack (music/SFX) ကို လုံးဝ မထည့်ပါ (legacy အတူ)။ နောက်ဆုံး row က trailing gap ထဲမှာ မပြောင်းပါ (legacy အတူ)။ နှစ်ခုလုံး product ဆုံးဖြတ်ချက် ဖြစ်ပါတယ်။
 
 ### အတည်ပြချက်
 
-- [x] **Source rows ဘယ်တော့မှ မပြောင်းထားပါ။** `id`/`original`/`start`/`duration` က locked။ Render test က row snapshot ကို render မတိုင်မီ/ပြီး နှစ်ဖက် တူညီကြောင်း စစ်ပါတယ်။
+- [x] **Source rows ဘယ်တော့မှ မပြောင်းထားပါ။** `id`/`original`/`start`/`duration` က locked။ Render test က row snapshot ကို render မတိုင်မီ/ပြီး နှစ်ဖက် တူညီကြောင်းကိုလည်း၊ **source media ဖိုင်က byte-identical** အဖြစ် ကျန်ရှိကြောင်းလည်း စစ်ပါတယ်။ ထပ်မံတွေ့ကားတဲ့ defect ကို ဖယ်ရှားဖို့ ရေးပြီး row snapshot တစ်ခုတည်းကို တိုင်းရက် မလုပ်ဘဲ **mixed audio ရဲ့ ပထမဆုံး non-silent sample က `row.start * 44100` နေရာမှာ ရှိတာ** ကို စစ်ပါတယ်။
 - [x] **Drift ဖြစ်တဲ့ translation ကို ငြင်းပါတယ်။** `start` ပြောင်းတဲ့ translation → speech မစတင်ခင်း `ValueError: changed start`၊ final file မရှိ။
-- [x] **Final duration + audio-stream validation အလုပ်လုပ်ပါတယ်။** Renderer က FFprobe နဲ့ duration (`max(0.1s, 1/fps)`)၊ audio stream၊ video stream သုံးခုလုံး စစ်ပြီးမှ final file ထုတ်ပါတယ်။ Coordinator ကလည်း output ပေါ်တွင် audio-stream check ကို ထပ်စစ်ပါတယ်။
+- [x] **Final duration + audio-stream validation အလုပ်လုပ်ပါတယ်။** Renderer က FFprobe နဲ့ container duration (`max(0.1s, 1/fps)`)၊ **audio stream ရဲ့ ကိုယ်ပိုင် duration**၊ video stream သုံးခုလုံး စစ်ပြီးမှ final file ထုတ်ပါတယ်။ Coordinator ကလည်း output ပေါ်တွင် audio-stream duration ကို ထပ်စစ်ပါတယ်။ Media duration က probed တန်းက authoritative ဖြစ်ပါတယ်။
 - [x] **Cache အလုပ်လုပ်ပါတယ်။** စကား/voice မပြောင်းရင် cache hit (file mtime မပြောင်း)၊ စကား ပြောင်းရင် invalidate။
 - [x] **UI က infrastructure ကို တိုက်ရိုက် မလုပ်ပါ။** `test_ui_layer_does_not_import_infrastructure` က ဆက်လက် အောင်မြင်ပါတယ်။
 
@@ -1101,10 +1123,11 @@ Next action: reject/report model timestamps outside authoritative media duration
 
 ### နောက်ဆုံး စစ်ဆေးချက်
 
-- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py tests/test_exact_dubbing_panel.py tests/test_exact_dubbing_validation_gate.py tests/test_transcript_regressions.py tests/test_architecture_gates.py -q --confcutdir=tests -p no:cacheprovider` → **82 passed, 1 skipped in 16.86s**။
-- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **412 passed, 1 skipped in 103.23s**။
+- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py -q --confcutdir=tests -p no:cacheprovider` → **29 passed in 33.25s**။
+- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py tests/test_exact_dubbing_panel.py tests/test_exact_dubbing_validation_gate.py tests/test_transcript_regressions.py tests/test_architecture_gates.py -q --confcutdir=tests -p no:cacheprovider` → **91 passed, 1 skipped in 34.31s**။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **421 passed, 1 skipped in 121.47s**။
 - `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
-- `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en` ဖြင့် opt-in real smoke → **1 passed in 7.80s**။
+- `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en` ဖြင့် opt-in real smoke → **1 passed**။
 
 
 
