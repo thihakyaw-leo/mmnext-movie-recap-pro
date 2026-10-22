@@ -21,8 +21,15 @@ The project is **not complete**. The PySide6 shell, separate mode/domain contrac
 > § U records the Exact Dubbing TTS/render/cache and final validation;
 > § V records the Phase 1 cleanup of the remaining review debt (domain
 > validation dedup, one duration tolerance, the orphan adapter removal and
-> the added coverage). The current full suite is
-> **425 passed, 1 skipped**.
+> the added coverage); § W proves the **REAL Edge TTS speech path**
+> (`edge-tts` installed, real Burmese audio through both legacy voices,
+> REAL labelling, and an offline switch that keeps the test suite
+> network-free). The current full suite is
+> **426 passed, 2 skipped** (the two skips are opt-in network tests).
+> A follow-up fix removed a CWD-writes violation in the narrator pipeline
+> tests (a bare relative output path put the speech cache in the repository
+> root) and added a regression guard for it; the current suite is
+> **427 passed, 2 skipped**.
 
 Fresh verification for this documentation update: `pytest tests -q --confcutdir=tests -p no:cacheprovider` with the approved local media/model fixture and project-local FFmpeg tools enabled: **291 passed in 63.32s**. Focused saved-transcript tests: `pytest tests/test_transcript_open.py -q --confcutdir=tests -p no:cacheprovider` → **6 passed in 0.27s**. This does not establish full product or clean-machine readiness.
 

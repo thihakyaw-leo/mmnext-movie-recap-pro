@@ -12,6 +12,7 @@ step and the render step, exactly as it is in the legacy pipeline.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -31,7 +32,19 @@ from .exact_dubbing_render_coordinator import (
     ExactDubbingRenderResult,
 )
 
-__all__ = ["ExactDubbingService"]
+__all__ = ["ExactDubbingService", "OFFLINE_TTS_ENV"]
+
+#: When this environment variable is set to a non-empty value the real Edge TTS
+#: network service is never used, even when the package is installed.  The test
+#: suite sets it so a render never depends on the network and its (variable)
+#: audio lengths stay deterministic.
+OFFLINE_TTS_ENV = "MMNEXT_EXACT_DUB_OFFLINE_TTS"
+
+
+def _offline_forced() -> bool:
+    """Whether the environment forces the offline speech synthesiser."""
+    value = os.environ.get(OFFLINE_TTS_ENV, "")
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 class ExactDubbingService:
@@ -43,23 +56,38 @@ class ExactDubbingService:
         ffmpeg: str = "ffmpeg",
         ffprobe: str = "ffprobe",
         legacy_root: Optional[str] = None,
+        allow_real_tts: Optional[bool] = None,
     ) -> None:
         self._jobs_dir = str(jobs_dir)
         self._ffmpeg = ffmpeg
         self._ffprobe = ffprobe
         self._legacy_root = legacy_root
+        if allow_real_tts is None:
+            allow_real_tts = not _offline_forced()
+        self._allow_real_tts = bool(allow_real_tts)
 
     # -- capabilities -------------------------------------------------------- #
     @property
     def cache_dir(self) -> str:
         return str(Path(self._jobs_dir) / "exact_dubbing_tts")
 
+    @property
+    def allow_real_tts(self) -> bool:
+        """Whether this service may use the real Edge TTS network service."""
+        return self._allow_real_tts
+
     def renderer_available(self) -> bool:
         """True when FFmpeg and FFprobe are available."""
         return FfmpegExactDubbingRenderer(self._ffmpeg, self._ffprobe).available()
 
     def tts_available(self) -> bool:
-        """True when the real Edge TTS synthesiser can be used."""
+        """True when the real Edge TTS synthesiser can be used.
+
+        This reports what *this* service would use, so it is False both when
+        the package is missing and when the offline switch is on.
+        """
+        if not self._allow_real_tts:
+            return False
         return LegacyExactDubbingTtsAdapter().available()
 
     def is_demo(self) -> bool:
@@ -88,8 +116,10 @@ class ExactDubbingService:
         real_tts = LegacyExactDubbingTtsAdapter(cache_dir=cache_dir, log=log)
         # The availability has to be read *before* the fallback: the demo
         # synthesiser is always available, so asking it would report a
-        # simulated speech run as REAL.
-        has_real_tts = real_tts.available()
+        # simulated speech run as REAL.  The offline switch also decides here,
+        # so a forced-offline run never reaches the network even though the
+        # package is installed.
+        has_real_tts = self._allow_real_tts and real_tts.available()
         tts = (
             real_tts
             if has_real_tts

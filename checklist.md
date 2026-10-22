@@ -1155,4 +1155,44 @@ Independent review က exact-dubbing slice ကို စစ်ဆေးပြီ
 - `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
 
 
+## W. Phase 2 — REAL Edge TTS speech path (2026-10-22)
+
+Exact-dubbing slice ရဲ့ Phase 2။ § V မှာ user ဆုံးဖြတ်ခဲ့သအတိုင်း soundtrack နဲ့ trailing-gap သည် legacy parity ဖြစ်လို့ **behaviour မပြောင်းခဲ့ပါ**။ အဓိက အလုပ်က **REAL speech path ကို ပထမဆုံး အမှန်တကယ် စမ်းပြီး** — ယခင်က `edge_tts` မရှိလို့ အသံပိုင်းက DEMO ပဲ ဖြစ်နေခဲ့ပါတယ်။
+
+### ပြောင်းလဲမှုများ
+
+- [x] **`edge-tts` ကို project venv သို့ တပ်ဆင်ခဲ့သည်** — `edge-tts 7.3.1` (+ `aiohttp` 3.14.5, `yarl`, `frozenlist`, `propcache`, `multidict`, `attrs`, `tabulate`, `aiohappyeyeballs`, `aiosignal`)။ Microsoft Edge TTS ဝန်ဆောင်မှုက ဤ environment မှာ ရောက်နိုင်ပါတယ် (Burmese voice တစ်ခုအတွက် 12384 bytes / 1.46s)။
+- [x] **Offline switch တစ်ခု တင်ဆင်ခဲ့သည်** — `mmnext/application/exact_dubbing_service.py` ရဲ့ `MMNEXT_EXACT_DUB_OFFLINE_TTS` env var နဲ့ `allow_real_tts` kwarg။ `edge_tts` ထည့်ခဲ့ပြီးနောက် **test suite တစ်ခုလုံးက network ကို မထိရကျိုးအောင်** လိုအပ်ခဲ့ပါတယ် — REAL speech ရဲ့ အရှည်က မတူညီလို့ deterministic assertion တွေ (`speed > 1.0`, `window == 2.6`) ပြိုလဲမှုရှိပါတယ်။ Production default က REAL (env မရှိရင်)၊ `tests/conftest.py` က suite တစ်ခုလုံးအတွက် offline ကို သတ်မှတ်ပါတယ်။
+- [x] **Opt-in REAL test တစ်ခု ထည့်ခဲ့သည်** — `tests/test_exact_dubbing_render.py::test_the_real_edge_tts_path_renders_a_labelled_real_dub` သည် `MMNEXT_EDGE_TTS_SMOKE=1` မရှိရင် skip ဖြစ်ပြီး `allow_real_tts=True` ကို တိတိကျကျ ဖြင့်ထားပါတယ်။ ၎င်းက အတည်ပြုသည့်အချက်များ: `result.is_demo` နဲ့ `report["is_demo"]` နှစ်ခုလုံး **False**၊ legacy voice mapping နှစ်ခုလုံး (`my-MM-ThihaNeural`, `my-MM-NilarNeural`) REAL audio နဲ့ အလုပ်လုပ်ခြင်း၊ နောက်ဆုံး output တွင် audio + video stream နှစ်ခုလုံးရှိခြင်း၊ cache တွင် REAL speech ကျန်ရှိခြင်း။
+- [x] **Offline switch အတွက် unit test ထည့်ခဲ့သည်** — `test_the_offline_switch_keeps_the_suite_off_the_network` သည် package ထည့်ခဲ့ပြီးပါ (offline မဖြစ်တာ) တွင် switch က အလုပ်လုပ်ကြောင်း၊ explicit opt-in က env ကို လွှဲသွားကြောင်း၊ forced-offline coordinator က `LocalWaveTtsAdapter` ကို အသုံးပြုကြောင်း စစ်ပါတယ်။
+- [x] **`LegacyExactDubbingTtsAdapter.available()` ကို cache လုပ်ခဲ့သည်** — `edge_tts` က `aiohttp` ကို ဆွဲတကြီးလို့ တစ်ခါတည်း import က ~2 စက္ကန့် ကြာပါတယ်။ availability က process တစ်ခုလုံးမှာ မပြောင်းနိုင်လို့ memoise လုပ်ပြီး render တစ်ခုချင်းစီ + UI status read တွေမှာ ပြန်မတွက်ရပါ။ Full suite က 206s → **135s** ဖြစ်လာပါတယ်။
+- [x] **အမည်ပေးတဲ့ ပြဿနာတစ်ခု ဖြေရှင်းခဲ့သည်** — coordinator က ရယူရသော TTS output ကို `.wav` ဟု အမည်ပေးထားပုံမှာ REAL synthesiser က MP3 bytes ရေးလို့ ဖြစ်ပါတယ် (offline က တကယ် PCM WAV)။ အခု **neutral `.audio`** extension ကို သုံးပါတယ် — renderer က mix မတိုင်မီ FFmpeg နဲ့ ပြန်ရေးလို့ container က မကျေနပ်ပါ။ အတိအလင်း မဟုတ်တဲ့ ဖိုင်အမည်ကို ဖယ်ရှားခဲ့ပါတယ်။
+- [x] **CWD-writes ချို့ယွင်းချက်ကို ဖမ်းမိပြီး ပြင်ဆင်ခဲ့သည်** — full suite ကို run လုပ်ပြီးနောက် repo root မှာ `narrator_tts/` + `out.mp4` ကျန်ရှိနေတာကို တွေ့ခဲ့ပါတယ်။ `tests/test_narrator_pipeline.py` က `coordinator.run(..., "out.mp4", {})` ကို **bare relative path** နဲ့ ခေါ်နေလို့ coordinator ရဲ့ cache fallback (`Path(output).parent / "narrator_tts"`) က CWD ဖြစ်သွားပါတယ်။ `Agent.md`/`AGENTS.md` က "never write real-job checkpoints to the CWD" ဟု ဆိုနေလို့ ၎င်းကို tmp_path သုံးစေရန် ပြင်ဆင်ပြီး stray artifact ၂ ခုကို ဖျက်ခဲ့ပါတယ်။ **Regression test** `test_the_pipeline_cache_stays_job_scoped` က cache က output အနီးမှာ ရှိပြီး CWD တွင် မကျန်ကြောင်း အာမခံပါတယ် (stray ၃ မျိုးကို စစ်ပါတယ်)။
+- [x] **`tests/conftest.py` ကို git သို့ တင်ခဲ့သည်** — offline switch က suite တစ်ခုလုံးအတွက် အရေးပါသောကြောင့် untracked မကျန်စေရပါ။
+
+### REAL Edge TTS — အတည်ပြထားသောရလဒ်များ
+
+- [x] **REAL render အပြည့်အစုံ အောင်မြင်ပါတယ်** (production path, `ExactDubbingService.render_from_translated_gender`) —
+  - `tts_available(): True`၊ `is_demo(): False`၊ `result.is_demo: False`
+  - Voice mapping: `s0` → `my-MM-ThihaNeural` (male), `s1` → `my-MM-NilarNeural` (female)
+  - Speech fitting: raw 2.064s → window 2.0s (speed 1.03x); raw 3.576s → window 2.0s (speed 1.79x, warning surfaced)
+  - Mix + mux: `h264_nvenc`, output **6.0s**, audio stream duration **6.0s**, video stream present
+  - `render_report.json`: `source_duration 6.0`, `output_duration 6.0`, `audio_duration 6.0`, `is_demo False`
+  - Cache: `0000_3b9f9231….audio` + `.sha256`, `0001_fbc6f47e….audio` + `.sha256` (signatures match)
+- [x] **Opt-in test → `1 passed in 9.07s`** (`MMNEXT_EDGE_TTS_SMOKE=1`)။
+- [x] **Offline suite က ဆက်လက် offline နှင့် စက်** — full suite မှာ REAL test က skip ဖြစ်ပါတယ်။ `conftest.py` က switch ကို သတ်မှတ်လို့ network မထိပါ။
+
+### ဆက်လက် မှန်တကယ် မလုပ်ရသေးသောအချက်
+
+- **REAL speech ကို production UI ကနေ တိတိကျကျ မစမ်းရသေးပါ** — production path ကို တိုက်ရိုက် service call နဲ့ စမ်းခဲ့ပါတယ် (ảင်ကို opt-in test က)၊ `start_exact_dubbing_render` ကနေ REAL ဖြစ်စေ မလုပ်ရသေးပါ။ တူညီသောလမ်းကြောင်းဖြစ်လို့ တန်ဖိုးနည်းပါတယ်၊ ဒါပေမယ့် UI button click-through ကို မှတ်တမ်းမတင်ရသေးပါ။
+- **`edge_tts` က network ပေါ်မူတည်ပါတယ်** — Microsoft ဝန်ဆောင်မှု 403/WSServerHandshakeError ဖြစ်တတ်ပါတယ် (legacy repo က မှတ်တမ်းတင်ထားပါတယ်)။ `LegacyExactDubbingTtsAdapter` မှာ retry ladder (5/10/20/40/60 စက္ကန့်) ရှိပြီး၊ ပထမ မအောင်မြင်သော row မှာ ရပ်ပါတယ်။ VPN/proxy ပြဿနာကို တိုက်ရိုက် မစစ်နိုင်ခဲ့ပါ။
+- **Whisper / Gemini / Smart Sync** — အခြားသော service တွေက REAL adapter အဆင့်မှာ ကျန်ရှိပါတယ် (Narrator slice)။
+
+### နောက်ဆုံး စစ်ဆေးချက်
+
+- `MMNEXT_EDGE_TTS_SMOKE=1 .\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py::test_the_real_edge_tts_path_renders_a_labelled_real_dub -q --confcutdir=tests` → **1 passed in 9.07s**။
+- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py -q --confcutdir=tests` → **34 passed, 1 skipped** (REAL opt-in)။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **427 passed, 2 skipped in 135.03s** (skips: REAL Edge TTS opt-in, Whisper real media opt-in)။ Repo root တွင် stray artifact **မကျန်ပါ**။
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
+
 

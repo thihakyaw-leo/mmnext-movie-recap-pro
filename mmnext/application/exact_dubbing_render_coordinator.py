@@ -182,7 +182,14 @@ class ExactDubbingRenderCoordinator:
                 # The file name is built from the positional index, never from
                 # the row id: a row id comes from an artefact and could contain
                 # path separators.  The legacy pipeline used the same scheme.
-                audio_path = cache_dir / f"{index:04d}_{key[:16]}.wav"
+                #
+                # The raw synthesis output keeps a *neutral* extension because
+                # the format depends on the synthesiser: the offline one writes
+                # PCM WAV, the real Edge TTS one writes MP3 bytes.  Naming it
+                # ``.wav`` would claim a format it does not have.  The renderer
+                # re-encodes it with FFmpeg before the mix reads it, so the
+                # container of the raw file never matters.
+                audio_path = cache_dir / f"{index:04d}_{key[:16]}.audio"
                 result_path = self.tts.synthesize_segment(
                     row.burmese, voice=voice, rate=base_rate, out_path=str(audio_path)
                 )

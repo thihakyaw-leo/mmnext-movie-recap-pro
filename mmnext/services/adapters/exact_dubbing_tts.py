@@ -52,6 +52,22 @@ __all__ = [
 #: The documented Edge TTS retry ladder (seconds between attempts).
 RETRY_BACKOFF_SECONDS = (5, 10, 20, 40, 60)
 
+#: Memoised "is ``edge_tts`` importable" answer, ``None`` until first asked.
+_EDGE_TTS_STATE: Optional[bool] = None
+
+
+def _edge_tts_importable() -> bool:
+    """Whether ``edge_tts`` can be imported, cached for the process lifetime."""
+    global _EDGE_TTS_STATE
+    if _EDGE_TTS_STATE is None:
+        try:
+            import edge_tts  # noqa: F401
+        except Exception:
+            _EDGE_TTS_STATE = False
+        else:
+            _EDGE_TTS_STATE = True
+    return _EDGE_TTS_STATE
+
 
 class _BaseExactDubbingTts:
     """Shared cache handling for the exact-dubbing synthesizers."""
@@ -117,12 +133,14 @@ class LegacyExactDubbingTtsAdapter(_BaseExactDubbingTts):
         self.voice = voice
 
     def available(self) -> bool:
-        """True when the ``edge_tts`` package is importable."""
-        try:
-            import edge_tts  # noqa: F401
-        except Exception:
-            return False
-        return True
+        """True when the ``edge_tts`` package is importable.
+
+        The import itself is cached: ``edge_tts`` pulls in ``aiohttp``, so
+        re-importing it on every availability probe (once per render job, plus
+        once per UI status read) costs a noticeable amount of time for a
+        question that cannot change while the process runs.
+        """
+        return _edge_tts_importable()
 
     def synthesize_segment(
         self,

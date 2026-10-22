@@ -13,6 +13,7 @@ merged, retimed or edited.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import wave
@@ -415,7 +416,7 @@ def test_render_reuses_cached_speech(tmp_path) -> None:
         settings=settings,
     )
     assert first.ok, first.message
-    cache = list((tmp_path / "jobs" / "tts").glob("*.wav"))
+    cache = list((tmp_path / "jobs" / "tts").glob("*.audio"))
     assert cache, "the synthesiser must leave cached audio behind"
     stamps = {path.stat().st_mtime_ns for path in cache}
 
@@ -780,3 +781,114 @@ def test_the_duration_tolerance_is_reported_and_reused(tmp_path) -> None:
         == pytest.approx(reported)
     )
     assert any("muxed with" in message for message in logs), logs[-5:]
+
+
+# --------------------------------------------------------------------------- #
+# Offline switch and the opt-in REAL speech path
+# --------------------------------------------------------------------------- #
+
+
+def test_the_offline_switch_keeps_the_suite_off_the_network(tmp_path, monkeypatch) -> None:
+    """The suite must never reach the real Edge TTS service.
+
+    ``edge_tts`` may be installed in the project venv (it is, to prove the REAL
+    path), so the switch - not the absence of a package - is what keeps a test
+    run deterministic and offline.
+    """
+    from mmnext.application.exact_dubbing_service import (
+        OFFLINE_TTS_ENV,
+        ExactDubbingService,
+    )
+    from mmnext.services.adapters.exact_dubbing_tts import (
+        LegacyExactDubbingTtsAdapter,
+    )
+
+    installed = LegacyExactDubbingTtsAdapter().available()
+
+    monkeypatch.setenv(OFFLINE_TTS_ENV, "1")
+    forced = ExactDubbingService(str(tmp_path / "jobs"))
+    assert forced.allow_real_tts is False
+    assert forced.tts_available() is False
+    assert forced.is_demo() is True
+
+    # An explicit opt-in wins over the environment switch.
+    opted_in = ExactDubbingService(str(tmp_path / "jobs"), allow_real_tts=True)
+    assert opted_in.allow_real_tts is True
+    assert opted_in.tts_available() == installed
+    assert opted_in.is_demo() is not installed
+
+    monkeypatch.setenv(OFFLINE_TTS_ENV, "")
+    monkeypatch.delenv(OFFLINE_TTS_ENV, raising=False)
+    default = ExactDubbingService(str(tmp_path / "jobs"))
+    assert default.allow_real_tts is True
+    assert default.tts_available() == installed
+
+    # The forced-offline run really uses the offline synthesiser, so the label
+    # and the cached file reflect simulated speech rather than a network call.
+    logs: list[str] = []
+    coordinator = forced.create_coordinator(
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")}, log=logs.append
+    )
+    assert coordinator.is_demo is True
+    assert type(coordinator.tts).__name__ == "LocalWaveTtsAdapter"
+
+
+real_edge_tts = pytest.mark.skipif(
+    not os.environ.get("MMNEXT_EDGE_TTS_SMOKE"),
+    reason="Opt-in only: set MMNEXT_EDGE_TTS_SMOKE=1 to exercise the real Edge TTS service",
+)
+
+
+@needs_ffmpeg
+@real_edge_tts
+def test_the_real_edge_tts_path_renders_a_labelled_real_dub(tmp_path) -> None:
+    """REAL speech end to end, over the network, on explicit request.
+
+    This is the only test that reaches Microsoft's Edge TTS service, so it is
+    opt-in: the suite as a whole stays offline and deterministic (see
+    ``test_the_offline_switch_keeps_the_suite_off_the_network``).  It proves what
+    the DEMO run cannot - that the real synthesiser, the gender -> voice mapping
+    and the REAL labelling all work together through the production path.
+    """
+    from mmnext.application.exact_dubbing_service import ExactDubbingService
+
+    rows = make_rows()
+    video = make_video(tmp_path / "source.mp4", seconds=4.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    # The conftest switch is on, so this test opts in explicitly.
+    service = ExactDubbingService(str(tmp_path / "jobs"), allow_real_tts=True)
+    if not service.tts_available():
+        pytest.skip("edge_tts is not installed")
+    assert service.is_demo() is False
+
+    result = service.render_from_translated_gender(
+        str(translation),
+        rows,
+        str(video),
+        4.0,
+        str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    assert result.is_demo is False, "a REAL speech run must not be labelled DEMO"
+
+    report = json.loads(
+        (output.with_name(output.stem + ".render_report.json")).read_text(encoding="utf-8")
+    )
+    assert report["is_demo"] is False
+    voices = {segment["voice"] for segment in report["segments"]}
+    # The gender -> voice mapping of the legacy contract, proven with real audio.
+    assert EXACT_DUB_VOICES["male"] in voices
+    assert EXACT_DUB_VOICES["female"] in voices
+    for segment in report["segments"]:
+        assert segment["raw_duration"] > 0, "the real synthesiser produced no audio"
+
+    info = probe(output)
+    duration = float(info["format"]["duration"])
+    assert abs(duration - 4.0) <= 0.25
+    audio = [s for s in info["streams"] if s["codec_type"] == "audio"]
+    assert audio, "the render must keep an audio stream"
+    cached = list((tmp_path / "jobs" / "tts").glob("*.audio"))
+    assert cached, "the real speech must be cached for reuse"
