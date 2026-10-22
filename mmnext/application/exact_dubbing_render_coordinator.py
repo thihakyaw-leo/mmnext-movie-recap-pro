@@ -250,7 +250,18 @@ class ExactDubbingRenderCoordinator:
                 # to validate that shortened output.
                 source_duration = self._audio_duration(Path(video_path), ffprobe)
                 expected = source_duration or video_duration
-                tolerance = float(settings.get("duration_tolerance", 0.25))
+                # One tolerance, not two: the renderer already applied its own
+                # number to the same checks and reports it back, so re-checking
+                # with a different (looser) one would let a file through that
+                # the renderer's own gate would have rejected.  The settings
+                # value is only a fallback for renderers that report none.
+                report = dict(getattr(self.renderer, "report", {}) or {})
+                tolerance = self._reported_tolerance(
+                    report, "duration_tolerance", settings, 0.25
+                )
+                audio_tolerance = self._reported_tolerance(
+                    report, "audio_tolerance", settings, 0.5
+                )
                 measured_duration = self._audio_duration(partial_output, ffprobe)
                 if measured_duration is None:
                     rendered = False
@@ -272,7 +283,6 @@ class ExactDubbingRenderCoordinator:
                 if rendered:
                     audio_duration = self._audio_stream_duration(partial_output, ffprobe)
                     if audio_duration is not None and expected > 0:
-                        audio_tolerance = max(float(settings.get("audio_tolerance", 0.5)), tolerance)
                         if abs(audio_duration - expected) > audio_tolerance:
                             rendered = False
                             message = (
@@ -295,6 +305,33 @@ class ExactDubbingRenderCoordinator:
             warnings=warnings,
             message=message,
         )
+
+    @staticmethod
+    def _reported_tolerance(
+        report: dict,
+        key: str,
+        settings: dict,
+        default: float,
+    ) -> float:
+        """Return the tolerance to re-check the published output with.
+
+        The renderer's own report wins: it already applied that number to the
+        same checks, so the coordinator must not use a looser one.  The settings
+        value is only a fallback for renderers that report none, and a
+        non-numeric report value is ignored rather than trusted.
+        """
+        value = report.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = default
+            if number >= 0:
+                return number
+        try:
+            return float(settings.get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     def _write_render_report(self, output_path: str, video_duration: float) -> None:
         """Write the render report next to the *published* output.

@@ -573,6 +573,13 @@ def test_the_ui_render_goes_through_the_exported_translation(tmp_path, qtbot) ->
             QTest.qWait(50)
             waited += 50
         assert context.exact_render_state == "done", context.exact_render_message
+        # The result is delivered before the thread's own ``finished`` signal,
+        # so the worker may still be tearing down when the state flips.  Wait
+        # for it separately instead of racing it.
+        waited = 0
+        while context.exact_render_running and waited < 30000:
+            QTest.qWait(50)
+            waited += 50
         assert not context.exact_render_running, "the render worker did not finish"
         assert (tmp_path / "final.mp4").is_file()
         report = tmp_path / "final.render_report.json"
@@ -652,3 +659,124 @@ def test_exported_translation_file_round_trips_into_a_render(tmp_path, qtbot) ->
         assert output.is_file()
     finally:
         context.jobs.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Uncovered paths found by the review cycle
+# --------------------------------------------------------------------------- #
+
+
+@needs_ffmpeg
+def test_speed_fit_needs_more_than_1_35x_warns_but_still_renders(tmp_path) -> None:
+    """A stretch past 1.35x is a warning, never a cap and never a failure."""
+    rows = [make_rows()[0]]
+    # The offline synthesiser produces a fixed length for this text, so make
+    # the locked window very short to force a large fit ratio.
+    rows[0].duration = 0.4
+    video = make_video(tmp_path / "source.mp4", seconds=2.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 2.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    assert any("1.35" in warning or "x the source" in warning for warning in result.warnings), result.warnings
+    assert output.is_file()
+
+
+@needs_ffmpeg
+def test_the_window_expands_into_the_gap_before_the_next_row(tmp_path) -> None:
+    """A row may use 80% of the following silence; never past the next row."""
+    rows = [
+        ExactDubbingRow(row_id="s0", start=0.0, duration=1.0,
+                        original="Hello there.", burmese=BURMESE_A,
+                        gender=Gender.MALE),
+        ExactDubbingRow(row_id="s1", start=3.0, duration=1.0,
+                        original="How are you?", burmese=BURMESE_B,
+                        gender=Gender.FEMALE),
+    ]
+    # The window for s0 must be min(1.0 + 0.8 * 2.0, 3.0 - 0.0) = 2.6s.
+    video = make_video(tmp_path / "source.mp4", seconds=4.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 4.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    report = json.loads(
+        (output.with_name(output.stem + ".render_report.json")).read_text(encoding="utf-8")
+    )
+    windows = {segment["id"]: segment["window"] for segment in report["segments"]}
+    assert windows["s0"] == pytest.approx(2.6)
+    assert windows["s1"] == pytest.approx(1.0)
+    # The fitted speech must not run past the window of the next row.
+    assert 0.0 <= windows["s0"] <= 3.0
+
+
+@needs_ffmpeg
+def test_a_long_speech_is_sped_up_and_trimmed_to_its_window(tmp_path) -> None:
+    """The atempo fit must keep the speech inside the locked window."""
+    rows = [make_rows()[1]]
+    rows[0].duration = 1.0
+    video = make_video(tmp_path / "source.mp4", seconds=3.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    result = service.render_from_translated_gender(
+        str(translation), rows, str(video), 3.0, str(output),
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")},
+    )
+    assert result.ok, result.message
+    report = json.loads(
+        (output.with_name(output.stem + ".render_report.json")).read_text(encoding="utf-8")
+    )
+    segment = report["segments"][0]
+    assert segment["speed"] > 1.0, "the speech was longer than the window"
+    # The fitted clip is written into the window, never past it.
+    assert segment["raw_duration"] > segment["window"]
+    # The published mix holds the whole source duration.
+    assert report["output_duration"] == pytest.approx(3.0, abs=0.1)
+
+
+@needs_ffmpeg
+def test_the_duration_tolerance_is_reported_and_reused(tmp_path) -> None:
+    """One tolerance drives both gates: the renderer's own number is reused."""
+    rows = make_rows()
+    video = make_video(tmp_path / "source.mp4", seconds=4.0)
+    translation = write_translation(tmp_path / "translated_gender.json", rows)
+    output = tmp_path / "final.mp4"
+
+    logs: list[str] = []
+    service = ExactDubbingService(str(tmp_path / "jobs"))
+    coordinator = service.create_coordinator(
+        settings={"tts_cache_dir": str(tmp_path / "jobs" / "tts")}, log=logs.append
+    )
+    result = coordinator.run(
+        rows, str(video), 4.0, str(output),
+        {"tts_cache_dir": str(tmp_path / "jobs" / "tts"), "duration_tolerance": 0.25},
+    )
+    assert result.ok, result.message
+
+    from mmnext.application.exact_dubbing_render_coordinator import (
+        ExactDubbingRenderCoordinator,
+    )
+
+    report = dict(getattr(coordinator.renderer, "report", {}) or {})
+    assert "duration_tolerance" in report, report
+    reported = float(report["duration_tolerance"])
+    # 4.0s at 15 fps -> max(0.1, 1/15) = 0.1
+    assert reported == pytest.approx(0.1)
+    assert (
+        ExactDubbingRenderCoordinator._reported_tolerance(
+            report, "duration_tolerance", {}, 0.25
+        )
+        == pytest.approx(reported)
+    )
+    assert any("muxed with" in message for message in logs), logs[-5:]

@@ -15,6 +15,14 @@ The project is **not complete**. The PySide6 shell, separate mode/domain contrac
 > the previous private repository path calls were replaced by public
 > `JobService`/`JobRepository` methods. Focused/full smoke verification:
 > `checklist.md` § S runs a clean full suite of **391 passed, 1 skipped**.
+>
+> **Superseded again by the Exact Dubbing slice (2026-10-22).**
+> `checklist.md` § T resolves the strict real-media Whisper acceptance;
+> § U records the Exact Dubbing TTS/render/cache and final validation;
+> § V records the Phase 1 cleanup of the remaining review debt (domain
+> validation dedup, one duration tolerance, the orphan adapter removal and
+> the added coverage). The current full suite is
+> **425 passed, 1 skipped**.
 
 Fresh verification for this documentation update: `pytest tests -q --confcutdir=tests -p no:cacheprovider` with the approved local media/model fixture and project-local FFmpeg tools enabled: **291 passed in 63.32s**. Focused saved-transcript tests: `pytest tests/test_transcript_open.py -q --confcutdir=tests -p no:cacheprovider` → **6 passed in 0.27s**. This does not establish full product or clean-machine readiness.
 

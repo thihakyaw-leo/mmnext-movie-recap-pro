@@ -10,7 +10,8 @@ the legacy ``movie-recap`` pipeline enforced:
   must match the source segment exactly (``start``/``duration`` within
   ``1e-6``);
 * ``burmese`` must be a non-blank string that contains real Myanmar Unicode
-  (never Zawgyi, never a row that is still English);
+  (the same definition :mod:`mmnext.domain.validation` uses - never Zawgyi,
+  never a row that is still English);
 * ``gender`` is one of ``male`` / ``female`` / ``unknown`` and selects the
   Edge TTS Myanmar voice.  ``unknown`` deliberately shares the female voice.
 
@@ -25,11 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from .enums import Gender
+from .validation import MYANMAR_SCRIPT_RE, TIMESTAMP_EPSILON, is_burmese
 
 __all__ = [
     "EXACT_DUB_VOICES",
@@ -45,7 +46,10 @@ __all__ = [
 ]
 
 #: Myanmar block (U+1000-U+109F) plus Myanmar Extended-A (U+AA60-U+AA7F).
-MYANMAR_UNICODE_PATTERN = re.compile(r"[\u1000-\u109f\uaa60-\uaa7f]")
+#: The pattern itself lives on :mod:`mmnext.domain.validation`, so there is one
+#: definition of "Myanmar text" in the whole domain layer; the alias keeps the
+#: older public name working.
+MYANMAR_UNICODE_PATTERN = MYANMAR_SCRIPT_RE
 
 #: Gender -> Edge TTS Myanmar voice.  The mapping itself lives on the
 #: :class:`~mmnext.domain.enums.Gender` enum, so there is only one source of
@@ -58,8 +62,9 @@ EXACT_DUB_VOICES: dict[str, str] = {
     "unknown": Gender.UNKNOWN.voice,
 }
 
-#: Source timing may never drift by more than this (seconds).
-TIMING_TOLERANCE = 1e-6
+#: Source timing may never drift by more than this (seconds).  The tolerance
+#: is the domain's legacy ``TIMESTAMP_EPSILON``.
+TIMING_TOLERANCE = TIMESTAMP_EPSILON
 
 _VALID_GENDERS = frozenset(EXACT_DUB_VOICES)
 
@@ -165,7 +170,7 @@ def parse_translated_gender(payload: Any) -> list[DubbingTranslation]:
         burmese = raw["burmese"]
         if not isinstance(burmese, str) or not burmese.strip():
             raise ValueError(f"Row {index}: Burmese translation is missing")
-        if not MYANMAR_UNICODE_PATTERN.search(burmese):
+        if not is_burmese(burmese):
             raise ValueError(
                 f"Row {index}: Burmese translation must contain Myanmar Unicode"
             )

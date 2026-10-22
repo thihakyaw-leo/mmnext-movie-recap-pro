@@ -540,8 +540,8 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
             if not self._has_audio_stream(info):
                 raise RenderValidationError("Output audio stream is missing.")
             audio_duration = self._stream_duration(info, "audio")
+            audio_tolerance = max(AUDIO_STREAM_TOLERANCE, tolerance)
             if audio_duration > 0:
-                audio_tolerance = max(AUDIO_STREAM_TOLERANCE, tolerance)
                 if abs(audio_duration - total) > audio_tolerance:
                     raise RenderValidationError(
                         f"Output audio stream duration {audio_duration:.3f}s differs "
@@ -554,6 +554,11 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
                 "output_duration": measured,
                 "audio_duration": audio_duration,
                 "encoder": codec,
+                # The tolerance actually applied to the checks above, so the
+                # coordinator can re-check the published output with exactly
+                # the same number instead of a second, looser one.
+                "duration_tolerance": tolerance,
+                "audio_tolerance": audio_tolerance,
                 "segments": details,
             }
             self.log(f"Exact dubbing render complete: {destination}")

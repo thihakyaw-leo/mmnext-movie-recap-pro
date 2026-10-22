@@ -1130,4 +1130,29 @@ Independent review က exact-dubbing slice ကို စစ်ဆေးပြီ
 - `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en` ဖြင့် opt-in real smoke → **1 passed**။
 
 
+## V. Phase 1 cleanup — exact-dubbing slice (2026-10-22)
+
+§ U ရဲ့ code-review fix cycle နောက်တွင် ကျန်ခဲ့သော **mechanical** debt အချက်လဲများကို ဖယ်ရှားခဲ့သော အပိုင်း။ **Behaviour မပြောင်းခဲ့ပါ** — review က အတည်ပြတဲ့ duplication/dead-code/test-gap အချက်များသာ။ ဆုံးဖြတ်ချက်သည် တောင်းဆိုခံရပြီး အချက်အလက်တွင် မှတ်တမ်းတင်ထားသည်။
+
+### ပြင်ဆင်ခဲ့သောအချက်များ
+
+- [x] **M1 — domain validation တစ်ခုတည်း ဖြစ်အောင် လုပ်ခဲ့သည်။** `mmnext/domain/exact_dubbing.py` က ကိုယ်ပိုင် Myanmar regex နဲ့ `1e-6` tolerance ကို ပြန်ရေးထားခဲ့ပုံမှာ `mmnext/domain/validation.py` ထဲမှာ `MYANMAR_SCRIPT_RE`၊ `TIMESTAMP_EPSILON`၊ `is_burmese()` သုံးခုလုံး ရှိပြီးသားဖြစ်လို့ ဒီအခါ အဲဒီတို့ကို import လုပ်ပြီး အစားထိုးထားသည်။ Public alias `MYANMAR_UNICODE_PATTERN` / `TIMING_TOLERANCE` ကို ထိန်းသိမ်းထားပြီး ဘယ်သူမှ ပြိုလုပ်မခံဘူး။ `validation.py` က `exact_dubbing` ကို import မလုပ်ထားလို့ import cycle မရှိ။
+- [x] **M11 — duration tolerance နှစ်မျိုး မရှိတော့ပါ။** Renderer က `max(0.1, 1/fps)` ကို report ထဲ `"duration_tolerance"` / `"audio_tolerance"` အဖြစ် တင်ထားပြီး၊ coordinator က အဲဒီတိုင်းတန်းကိုသာ ပြန်စစ်ပါတယ်။ ရှေ့ကအတိုင်း coordinator ရဲ့ setting `0.25` က report မရှိတဲ့ renderer အတွက် fallback ဖြစ်ပါတယ် — ဒါပေမယ့် **အစိုးရတချို့** သည် renderer ရဲ့ သတ်မှတ်ချက်အတိုင်း ရှိလို့ coordinator က ပိုကျယ်တဲ့ တန်ဖိုးနဲ့ ပြန်စစ်ပြီး renderer က ငြင်းခဲ့သော output ကို ဖြတ်ပေးခံရမှာ မဟုတ်တော့ဘူး။ မှားနေတဲ့ report တန်ဖိုးကို ခုခံမထားပါ (string/bool ကို ငြင်းပြီး fallback သုံးပါတယ်)။
+- [x] **Orphan adapter ကို ဖျက်ခဲ့သည်။** `mmnext/services/adapters/exact_dubbing_render.py` ရဲ့ `LegacyExactDubbingRenderer` / `DemoExactDubbingRenderer` နှစ်ခုလုံး native `FfmpegExactDubbingRenderer` က အစားထိုးပြီးမှ ဘယ်လူမှ import မလုပ်တော့ (AST scan နဲ့ package တစ်ခုလုံးမှာ အတည်ပြပြီး) — ဖျက်ခဲ့သည်။ `ExactDubbingRenderer` protocol ကို `mmnext/services/protocols.py` မှာ ထိန်းသိမ်း (renderer က သုံးပါတယ်)။ `__init__.py` အလွတ်ဖြစ်လို့ လုံးဝ မလိုအပ်။
+- [x] **M7 — ကျန်ခဲ့သော test gap များ ဖြည့်ခဲ့သည်။** >1.35× speed-fit က warning ဖြစ်ပြီး cap မဟုတ်တာ၊ 80 % gap-expansion က real render မှာ အလုပ်လုပ်တာ၊ ရှည်တဲ့ speech ကို atempo နဲ့ fit လုပ်ပြီး window အတွင်းချုံ့တာ၊ နဲ့ duration tolerance တစ်ခုတည်း report ကနေ ပြန်ပြန်စစ်တာ — အသစ် test ၄ ခု။
+
+### ဆုံးဖြတ်ချက်များ (user မေးမြန်းပြီး)
+
+- [x] **မူလ video ရဲ့ အသံ (music/SFX) ကို လုံးဝ မထည့်ပါ** — legacy `movie-recap` အတူ speech-only mix။ ဆုံးဖြတ်ချက်: **legacy အတူ**။ Render contract မပြောင်း။
+- [x] **Real Edge TTS run မလုပ်ရသေးပါ** — `edge_tts` မရှိ + environment မှာ network မရှိ။ အသံပိုင်း ဆက်လက် DEMO။
+- [x] **နောက်ဆုံး row ရဲ့ trailing gap** — legacy parity (trailing silence ထဲ မပြောင်း) — record only.
+- [x] **Edge TTS retry ladder (၁၃၅ စက္ကန့်/row)** — legacy parity + coordinator က ပထမဆုံး မအောင်မြင်သော row မှာ ရိုက်တာမို့ review က မှားယွင်းစွာ ဖော်ပြခဲ့သော "၁၈ နာရီ" မဖြစ်ပါ — record only.
+
+### နောက်ဆုံး စစ်ဆေးချက်
+
+- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py tests/test_exact_dubbing_panel.py tests/test_exact_dubbing_validation_gate.py tests/test_transcript_regressions.py tests/test_architecture_gates.py -q --confcutdir=tests` → **95 passed, 1 skipped in 64.42s**။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **425 passed, 1 skipped in 150.08s**။
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
+
+
 
