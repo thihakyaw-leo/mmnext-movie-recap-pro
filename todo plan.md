@@ -8,6 +8,14 @@ Build the product in vertical milestones. The first milestone is UI-first and mu
 
 The project is **not complete**. The PySide6 shell, separate mode/domain contracts, job/checkpoint repository components, and local Whisper transcript slice exist. Strict real-media and live-UI transcript acceptance is documented in `checklist.md` § N.
 
+> **Latest superseding cycle — UI→infrastructure isolation / code-review debt
+> (2026-10-21, same day).** The paragraph below is dated history. The current
+> source-verified state for this cleanup is recorded in:
+> `checklist.md` § S. The UI no longer imports `infrastructure` directly, and
+> the previous private repository path calls were replaced by public
+> `JobService`/`JobRepository` methods. Focused/full smoke verification:
+> `checklist.md` § S runs a clean full suite of **391 passed, 1 skipped**.
+
 Fresh verification for this documentation update: `pytest tests -q --confcutdir=tests -p no:cacheprovider` with the approved local media/model fixture and project-local FFmpeg tools enabled: **291 passed in 63.32s**. Focused saved-transcript tests: `pytest tests/test_transcript_open.py -q --confcutdir=tests -p no:cacheprovider` → **6 passed in 0.27s**. This does not establish full product or clean-machine readiness.
 
 > **Superseding audit — later the same day, after the transcript reopen / canonical
@@ -79,7 +87,7 @@ The Jobs screen and `AppContext.open_transcript_from_job()` contain an explicit 
     `tests/test_transcript_reopen_thread.py` (6) cover every listed case,
     including a reopen driven by a real adapter-written artefact.
 - [ ] Mark this slice complete only after a fresh full suite, the strict transcript acceptance, and a real Jobs→Workspace restart integration check all succeed.
-  - **Partly done.** Fresh full suite **384 passed, 1 skipped** and the
+  - **Now done** (2026-10-22). Fresh full suite **392 passed, 1 skipped** and the
     offscreen shell smoke is clean. A follow-up code-review cycle fixed five
     defects the first implementation introduced (edit loss during a load, an
     unsynced mode, crashes on malformed artefacts, an order-dependent result
@@ -87,11 +95,34 @@ The Jobs screen and `AppContext.open_transcript_from_job()` contain an explicit 
     "Code-review cycle — findings and fixes" below. The latest regression
     coverage also verifies that a successful REAL run writes completed Job
     metadata, registers the job live, and is rediscovered by a fresh
-    `AppContext`. The strict real-media Whisper acceptance and a real
-    restart-to-Workspace check still need an approved media fixture and a
-    locally cached Whisper model.
+    `AppContext`.
+  - **Strict real-media Whisper acceptance: PASS.** The earlier failure came from
+    pointing the acceptance at the *clipped* fixture
+    `.work/transcript-acceptance/inputs/osr-harvard-12s.mp4` — an artificial
+    12-second cut of an 18.356s recording, which truncates the last utterance
+    so Whisper's final segment legitimately ends past the clip boundary. The
+    canonical runner `.work/transcript-acceptance/boundary_acceptance.py` now
+    passes with **zero tolerance**: `status: PASS`, `clipped_rejection: PASS`
+    (the strict rejection of the clipped source is still enforced),
+    `full_source: PASS` (6 rows, last end 17.600s ≤ 18.357s, inference 2.051s)
+    and `real_ui: PASS` (offscreen REAL button → QThread → real FFmpeg/Whisper →
+    6 rows, REAL badge, progress 100). No source row was clamped, dropped,
+    merged or retimed; see `checklist.md` § T.
+  - **Real Jobs→Workspace restart: PASS (automated).** A successful REAL run
+    writes a versioned COMPLETE Job record with the committed artefact path and
+    fingerprint, a fresh `AppContext` rediscovers it from
+    `scan()["completed_real"]`, and the explicit open path reopens the artefact
+    on a worker thread with strict validation.
 
-Do not begin translation, TTS, or final video rendering until this persistence/recovery slice has a truthful end-to-end acceptance path. After it, prioritize a real Narrator vertical slice, then Exact Dubbing, Splitter, Common Editing, and release hardening.
+The persistence/recovery slice now has a truthful end-to-end acceptance path
+(fresh full suite, strict real-media Whisper acceptance with zero tolerance,
+and an automated Jobs→Workspace restart), so the gate on starting translation,
+TTS and rendering is **open**. The Exact Dubbing TTS/render/cache slice and
+its final duration/audio-stream validation are implemented on top of
+`translated_gender.json` — see `checklist.md` § U. Next priority: the real
+Edge TTS speech run (the audio is still DEMO because `edge_tts` is not
+installed and the environment has no network), then the Narrator vertical
+slice, then Splitter, Common Editing, and release hardening.
 
 ## Current verified status — narrator pipeline slice
 
@@ -350,6 +381,16 @@ are fixed and each has a regression test.
    stage/segment boundaries and reuse detection.
 2. Exact Dubbing prepare/export, TTS cache, speech fitting, final duration
    and audio-stream validation.
+   - **Done** (2026-10-22). `translated_gender.json` drives the render:
+     `mmnext/domain/exact_dubbing.py` owns the schema and the fitting maths,
+     `mmnext/services/adapters/exact_dubbing_tts.py` owns the content-addressed
+     TTS cache, `mmnext/infrastructure/exact_dubbing_render.py` fits, mixes,
+     muxes and validates with FFmpeg/FFprobe, and
+     `mmnext/application/exact_dubbing_service.py` is the UI-facing facade.
+     The renderer, the fit, the mix, the mux and the final validation are
+     REAL and exercised by `tests/test_exact_dubbing_render.py`; only the
+     *speech* is still DEMO because `edge_tts` is not installed. See
+     `checklist.md` § U.
 3. Splitter planner, smart-cut/short-tail rules, per-part resume.
 4. Common Editing non-destructive timeline, overlays, export validation.
 5. Windows packaging, diagnostics, clean-machine and non-ASCII path testing.

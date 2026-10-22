@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmnext-movie-recap-pro"
+version = "0.1.0"
+description = "MMNext Movie Recap Pro - Windows desktop recap, dubbing, splitter and editing application (UI-first milestone 1)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+]
+# Optional local runtime for the REAL adapters.  The application still starts
+# without them: the exact-dubbing renderer needs numpy for the mix, the
+# transcript adapter needs faster-whisper and the real speech needs edge-tts.
+real = [
+    "numpy>=1.24",
+    "faster-whisper>=1.0",
+    "edge-tts>=7.0",
+]
+
+[project.scripts]
+mmnext = "mmnext.main:main"
+
+[tool.setuptools]
+packages = [
+    "mmnext",
+    "mmnext.application",
+    "mmnext.domain",
+    "mmnext.infrastructure",
+    "mmnext.infrastructure.repository",
+    "mmnext.services",
+    "mmnext.services.adapters",
+    "mmnext.services.demo",
+    "mmnext.ui",
+    "mmnext.ui.models",
+    "mmnext.ui.navigation",
+    "mmnext.ui.screens",
+    "mmnext.ui.theme",
+    "mmnext.ui.widgets",
+    "mmnext.ui.workspace",
+    "mmnext.ui.workspace.mode_panels",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]

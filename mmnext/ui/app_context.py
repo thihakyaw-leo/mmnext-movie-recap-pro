@@ -18,10 +18,13 @@ from PySide6.QtCore import QObject, Signal
 
 from ..application.download_controller import DownloadController, DownloadEvent
 from ..application.job_manager import JobManager
+from ..application.job_service import JobService
 from ..application.mode_coordinators import ModeCoordinator, build_coordinator
 from ..application.narrator_coordinator import NarratorPlanCoordinator
 from ..application.project_controller import ProjectController
+from ..application.runtime_service import RuntimeService
 from ..domain.enums import AppMode, JobState, Stage, TaskState
+from ..domain.events import ProgressEvent
 from ..domain.models import (
     DownloadItem,
     ExactDubbingRow,
@@ -147,6 +150,14 @@ class AppContext(QObject):
     narratorProgress = Signal(object)          # ProgressEvent
     narratorStateChanged = Signal(str, str)
 
+    # splitter
+    splitterProgress = Signal(object)
+    splitterStateChanged = Signal(str, str)
+
+    # exact dubbing render
+    exactRenderProgress = Signal(object)
+    exactRenderStateChanged = Signal(str, str)
+
     def __init__(self, jobs_dir: Optional[str] = None, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
 
@@ -173,9 +184,8 @@ class AppContext(QObject):
         self._jobs_dir = jobs_dir
         Path(self._jobs_dir).mkdir(parents=True, exist_ok=True)
         # Phase 2: repository-backed startup scan
-        self._job_repository = None
-        from ..infrastructure.repository.job_repository import JobRepository
-        self._job_repository = JobRepository(self._jobs_dir)
+        self._jobs = JobService(self._jobs_dir)
+        self._runtime = RuntimeService()
         self._load_recoverable_jobs_from_repo()
 
         self._coordinator: Optional[ModeCoordinator] = None
@@ -201,6 +211,14 @@ class AppContext(QObject):
         self._narrator_thread = None
         self.narrator_state = "idle"
         self.narrator_message = "No narrator run yet."
+
+        self._exact_render_thread = None
+        self.exact_render_state = "idle"
+        self.exact_render_message = "No exact dubbing render yet."
+
+        self._splitter_thread = None
+        self.splitter_state = "idle"
+        self.splitter_message = "No splitter run yet."
 
         self.project.add_listener(self._on_project_event)
         self.downloads.add_listener(self._on_download_event)
@@ -304,10 +322,22 @@ class AppContext(QObject):
     def log_entries(self) -> list[LogEntry]:
         return list(self._log_entries)
 
+    @property
+    def _job_repository(self):
+        """Backwards-compatible view onto the application job facade."""
+        return self._jobs.repository
+
+    @_job_repository.setter
+    def _job_repository(self, repository) -> None:
+        self._jobs.repository = repository
+
+    def detect_dependencies(self) -> dict:
+        return self._runtime.detect()
+
     def _load_recoverable_jobs_from_repo(self) -> None:
         if not self._job_repository:
             return
-        scan = self._job_repository.scan()
+        scan = self._jobs.scan()
         for job, src_dir in scan.get("recoverable", []):
             try:
                 self.jobs.add(job)
@@ -336,7 +366,6 @@ class AppContext(QObject):
         """Explicit real action; no demo provider and no implicit cloud work."""
         from pathlib import Path
         from ..domain.models import VideoSource
-        from ..infrastructure.transcript_adapter import WhisperTranscriptAdapter
         from .transcript_worker import TranscriptWorkerThread
 
         if self.transcript_running:
@@ -350,7 +379,9 @@ class AppContext(QObject):
         self.selection.clear()
         self._transcript_session = session
         self.transcript_language = ""
-        provider = WhisperTranscriptAdapter(jobs_dir, media_path, mode=session.mode, is_demo=False)
+        provider = self._jobs.create_transcript_provider(
+            media_path, session.mode, is_demo=False
+        )
         thread = TranscriptWorkerThread(provider, media_path, language, auto_detect, parent=self)
         self._transcript_thread = thread
         thread.progress.connect(self._on_transcript_progress)
@@ -409,6 +440,227 @@ class AppContext(QObject):
         self.sessionChanged.emit()
         return exact_rows
 
+    def export_exact_dubbing(self, output_path: Optional[str] = None) -> str:
+        if self.project.session is None:
+            raise ValueError("No project session")
+        report = self.validate(AppMode.EXACT_DUBBING)
+        if report.errors:
+            raise ValueError(f"Exact dubbing validation failed: {report.summary}")
+        rows = self.project.session.exact_rows
+        if not rows:
+            raise ValueError("No exact-dubbing rows to export")
+        payload = [
+            {
+                # The legacy contract uses the positional index as ``id``; the
+                # source row id travels in the extra ``row_id`` key, which the
+                # legacy reader tolerates.
+                "id": index,
+                "row_id": row.row_id,
+                "start": row.start,
+                "duration": row.duration,
+                "original": row.original,
+                "burmese": row.burmese,
+                "gender": getattr(row.gender, "value", row.gender),
+            }
+            for index, row in enumerate(rows)
+        ]
+        from pathlib import Path
+
+        from ..domain.paths import atomic_write_json
+
+        if output_path is None:
+            target_dir = Path(self.project.session.output_folder or self._jobs_dir)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = target_dir / "translated_gender.json"
+        else:
+            path = Path(output_path)
+        atomic_write_json(path, payload)
+        return str(path)
+
+    @property
+    def exact_render_running(self) -> bool:
+        return self._exact_render_thread is not None and self._exact_render_thread.isRunning()
+
+    def start_exact_dubbing_render(self, video_path: str = "", output_path: str = "", settings: Optional[dict] = None) -> None:
+        if self.exact_render_running:
+            raise RuntimeError("An exact dubbing render is already in progress")
+        session = self.project.session
+        if session is None:
+            raise ValueError("No project session")
+        rows = self.project.session.exact_rows
+        if not rows:
+            raise ValueError("No exact-dubbing rows to render")
+        report = self.validate(AppMode.EXACT_DUBBING)
+        if report.errors:
+            raise ValueError(f"Exact dubbing validation failed: {report.summary}")
+        duration = float(session.total_duration())
+        if duration <= 0:
+            raise ValueError("No source duration to render against")
+        source_path = video_path or (session.source.location if session.source else "")
+        target_path = output_path or str(
+            Path(session.output_folder or self._jobs_dir) / "final_exact_gender_dub.mp4"
+        )
+        cache_dir = str(Path(self._jobs_dir) / "exact_dubbing_tts")
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+        from ..application.exact_dubbing_service import ExactDubbingService
+        from .exact_dubbing_render_worker import ExactDubbingRenderThread
+
+        settings = dict(settings or {})
+        settings.setdefault("tts_cache_dir", cache_dir)
+        settings.setdefault("voice", "my-MM-NilarNeural")
+        settings.setdefault("rate", 1.0)
+        # The authoritative source duration travels with the run so the
+        # renderer can validate the output against it.
+        settings.setdefault("total_duration", duration)
+
+        # The UI never imports infrastructure: the application facade owns the
+        # real FFmpeg renderer and the real Edge TTS synthesiser.
+        service = ExactDubbingService(self._jobs_dir)
+        coordinator = service.create_coordinator(settings=settings)
+        is_demo = coordinator.is_demo
+        thread = ExactDubbingRenderThread(
+            coordinator, rows, source_path, duration, target_path, settings, parent=self
+        )
+        self._exact_render_thread = thread
+        thread.progress.connect(self._on_exact_render_progress)
+        thread.log.connect(self._on_exact_render_log)
+        thread.result.connect(self._on_exact_render_result)
+        thread.error.connect(self._on_exact_render_error)
+        thread.finished.connect(self._on_exact_render_finished)
+        self._set_exact_render_state("running", f"{'DEMO' if is_demo else 'REAL'} exact dubbing render: TTS -> fit -> render.")
+        thread.start()
+
+    def stop_exact_dubbing_render(self) -> None:
+        if self.exact_render_running:
+            self._exact_render_thread.stop()
+            self._set_exact_render_state("stopping", "Stop requested; finishing current row.")
+
+    def _set_exact_render_state(self, state: str, message: str) -> None:
+        self.exact_render_state = state
+        self.exact_render_message = message
+        self.exactRenderStateChanged.emit(state, message)
+
+    def _on_exact_render_progress(self, event) -> None:
+        self.exactRenderProgress.emit(event)
+
+    def _on_exact_render_log(self, message: str) -> None:
+        self.append_log(LogEntry(message=message, stage=Stage.IDLE))
+
+    def _on_exact_render_result(self, result) -> None:
+        if getattr(result, "stopped", False):
+            self._set_exact_render_state("stopped", "Exact dubbing render stopped.")
+        elif getattr(result, "ok", False):
+            label = "DEMO" if getattr(result, "is_demo", True) else "REAL"
+            self._set_exact_render_state("done", f"{label} exact dubbing render finished: {getattr(result, 'output_path', '')}")
+        else:
+            self._set_exact_render_state("failed", getattr(result, "message", "") or "Exact dubbing render failed.")
+
+    def _on_exact_render_error(self, message: str) -> None:
+        self._set_exact_render_state("failed", f"Exact dubbing render failed: {message}")
+
+    def _on_exact_render_finished(self) -> None:
+        thread = self.sender()
+        if thread is self._exact_render_thread:
+            self._exact_render_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    @property
+    def splitter_running(self) -> bool:
+        return self._splitter_thread is not None and self._splitter_thread.isRunning()
+
+    def plan_splitter(
+        self,
+        part_seconds: Optional[float] = None,
+        max_extra_wait: float = 5.0,
+        smart_cut: bool = False,
+        pause_times: Optional[list[float]] = None,
+    ) -> list:
+        if self.project.session is None:
+            raise ValueError("No project session")
+        duration = float(self.project.session.total_duration())
+        if duration <= 0:
+            raise ValueError("No source duration to plan against")
+        part_seconds = float(part_seconds or 60.0)
+        from ..services.adapters.splitter import DemoSplitterPlanner
+
+        planner = DemoSplitterPlanner()
+        parts = planner.plan(duration, part_seconds, max_extra_wait, pause_times or [], smart_cut)
+        self.project.set_split_parts(parts)
+        self.sessionChanged.emit()
+        return parts
+
+    def start_splitter_render(self, video_path: str = "", output_dir: str = "", settings: Optional[dict] = None) -> None:
+        if self.splitter_running:
+            raise RuntimeError("A splitter render is already in progress")
+        session = self.project.session
+        if session is None:
+            raise ValueError("No project session")
+        parts = self.project.session.split_parts
+        selected = [part for part in parts if getattr(part, "include", True)]
+        if not selected:
+            raise ValueError("No selected parts to render")
+        source_path = video_path or (session.source.location if session.source else "")
+        target_dir = output_dir or str(Path(session.output_folder or self._jobs_dir) / "splitter")
+        Path(target_dir).mkdir(parents=True, exist_ok=True)
+        from ..services.adapters.splitter import DemoSplitterPlanner, DemoSplitterRenderer, LegacySplitterRenderer
+        from .splitter_render_worker import SplitterRenderThread
+        from ..application.splitter_render_coordinator import SplitterRenderCoordinator
+
+        renderer = LegacySplitterRenderer() if not session.is_demo else DemoSplitterRenderer()
+        is_demo = session.is_demo or not renderer.available()
+        if is_demo:
+            renderer = DemoSplitterRenderer()
+        coordinator = SplitterRenderCoordinator(planner=DemoSplitterPlanner(), renderer=renderer, is_demo=is_demo)
+        settings = dict(settings or {})
+        settings.setdefault("ratio", session.output_ratio.value)
+        settings.setdefault("fill", session.frame_fill.value)
+        thread = SplitterRenderThread(coordinator, parts, source_path, target_dir, settings, parent=self)
+        self._splitter_thread = thread
+        thread.progress.connect(self._on_splitter_progress)
+        thread.log.connect(self._on_splitter_log)
+        thread.result.connect(self._on_splitter_result)
+        thread.error.connect(self._on_splitter_error)
+        thread.finished.connect(self._on_splitter_finished)
+        self._set_splitter_state("running", f"{'DEMO' if is_demo else 'REAL'} splitter render: plan -> render parts.")
+        thread.start()
+
+    def stop_splitter_render(self) -> None:
+        if self.splitter_running:
+            self._splitter_thread.stop()
+            self._set_splitter_state("stopping", "Stop requested; finishing current part.")
+
+    def _set_splitter_state(self, state: str, message: str) -> None:
+        self.splitter_state = state
+        self.splitter_message = message
+        self.splitterStateChanged.emit(state, message)
+
+    def _on_splitter_progress(self, event) -> None:
+        self.splitterProgress.emit(event)
+
+    def _on_splitter_log(self, message: str) -> None:
+        self.append_log(LogEntry(message=message, stage=Stage.IDLE))
+
+    def _on_splitter_result(self, result) -> None:
+        if getattr(result, "stopped", False):
+            self._set_splitter_state("stopped", "Splitter render stopped.")
+        elif getattr(result, "ok", False):
+            label = "DEMO" if getattr(result, "is_demo", True) else "REAL"
+            self._set_splitter_state("done", f"{label} splitter render finished: {len(getattr(result, 'output_paths', []))} parts.")
+        else:
+            self._set_splitter_state("failed", getattr(result, "message", "") or "Splitter render failed.")
+
+    def _on_splitter_error(self, message: str) -> None:
+        self._set_splitter_state("failed", f"Splitter render failed: {message}")
+
+    def _on_splitter_finished(self) -> None:
+        thread = self.sender()
+        if thread is self._splitter_thread:
+            self._splitter_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
     # -- narrator pipeline -------------------------------------------------- #
     @property
     def narrator_pipeline_running(self) -> bool:
@@ -456,7 +708,7 @@ class AppContext(QObject):
 
         cache_dir = str(Path(self._jobs_dir) / "narrator_cache")
 
-        translator = LegacyNarratorTranslationAdapter()
+        translator = LegacyNarratorTranslationAdapter(api_key=None)
         tts = LegacyEdgeTtsAdapter(cache_dir=cache_dir)
         renderer = LegacySmartSyncRenderer()
         is_demo = not (
@@ -466,6 +718,15 @@ class AppContext(QObject):
             translator = DemoTranslationProvider()
             tts = DemoSpeechSynthesizer(cache_dir=cache_dir)
             renderer = DemoSmartSyncRenderer()
+
+        settings = dict(settings or {})
+        settings.setdefault("tts_cache_dir", cache_dir)
+        settings.setdefault(
+            "translation_checkpoint",
+            str(Path(self._jobs_dir) / "narrator_translation_checkpoint.json"),
+        )
+        settings.setdefault("context", "")
+        settings.setdefault("glossary", {})
 
         coordinator = NarratorPipelineCoordinator(
             plan_coordinator=self._narrator_coordinator,
@@ -485,7 +746,7 @@ class AppContext(QObject):
         thread.finished.connect(self._on_narrator_thread_finished)
         self._set_narrator_state(
             "running",
-            "DEMO narrator pipeline: plan -> translate -> synthesise -> render.",
+            f"{'DEMO' if is_demo else 'REAL'} narrator pipeline: plan -> translate -> synthesise -> render.",
         )
         thread.start()
 
@@ -532,185 +793,21 @@ class AppContext(QObject):
     def prepare_transcript_from_job(
         self, job_id: str, source_path: str
     ) -> tuple[ProjectSession, list[TranscriptRow], str]:
-        """Read and validate a completed REAL transcript artefact.
+        """Validate a completed REAL transcript off the GUI thread.
 
-        This is the off-the-GUI-thread validation core: it reads the job
-        record and the artefact and returns everything needed to apply the
-        transcript, but it touches **no** project state.  The caller applies
-        the result on the GUI thread, after checking that the request is
-        still the current one.
+        Delegates all repository/artifact validation to the application job
+        service and touches **no** project state.  The caller applies the result
+        on the GUI thread after checking that the request is still current.
 
         Returns ``(session, rows, language)``.
         """
-        if self._job_repository is None:
-            raise RuntimeError("Job repository not configured; cannot open transcript from jobs")
         if self.dirty.total_dirty():
             raise ValueError("Discard unsaved edits explicitly before opening a transcript")
-        # Stale-request guard.  ``start_reopen_transcript`` records the
-        # in-flight request; a request that no longer matches it belongs to a
-        # job/source the user has already moved away from, so it is refused
-        # before anything is applied.  A direct (non-threaded) call has no
-        # token and is therefore not affected.
         if self._reopen_token is not None and self._reopen_token != (job_id, source_path):
             raise ValueError(
                 "Stale reopen request: the selected job or source changed; reopen again."
             )
-        job = self._job_repository.load(job_id, source_path)
-        if job is None:
-            raise FileNotFoundError(f"Job {job_id} not found for source {source_path}")
-        # Validate job state
-        from ..domain.enums import JobState
-        if job.state != JobState.COMPLETE:
-            raise ValueError(f"Job {job_id} is not complete (state={job.state.value})")
-        if job.is_demo:
-            raise ValueError("Demo transcripts cannot be opened as REAL data")
-        if job.source is None:
-            raise ValueError("Job has no source metadata")
-        # Compute artifact path using repository layout
-        from pathlib import Path
-        job_dir = self._job_repository._job_dir(job_id, source_path)
-        mode = job.mode
-        artifact_dir = job_dir / mode.value / "transcripts"
-        stem = Path(source_path).stem
-        artifact_path = artifact_dir / f"{stem}.transcript.json"
-        if not artifact_path.exists():
-            raise FileNotFoundError(f"Transcript artifact missing at {artifact_path}")
-        # Load and validate artifact atomically
-        from ..domain.paths import read_json
-        data = read_json(artifact_path)
-        # The file may hold any JSON value.  Only a JSON object can carry the
-        # contract, so anything else is a corrupt artefact - never a crash.
-        if not isinstance(data, dict) or not data:
-            raise ValueError("Transcript artifact is corrupt or unreadable")
-        try:
-            schema_version = int(data.get("schema_version", 0) or 0)
-        except (TypeError, ValueError):
-            schema_version = -1
-        if schema_version != 1:
-            raise ValueError(f"Unsupported transcript schema version {data.get('schema_version')}")
-        if bool(data.get("is_demo", True)):
-            raise ValueError("Artifact is marked as demo; REAL data required")
-        # Source identity match
-        #
-        # The media must still be readable: comparing the identity of a file
-        # that no longer exists cannot succeed, and the user needs a clear
-        # "the media is gone" message rather than an OS error.
-        from ..domain.fingerprint import is_canonical_fingerprint, is_source_available
-        from ..infrastructure.repository.job_repository import compute_fingerprint
-
-        artifact_source = str(data.get("source_path", ""))
-        if not artifact_source:
-            raise ValueError("Transcript artifact has no source path")
-        source_type_val = getattr(job.source.source_type, "value", job.source.source_type)
-        if not is_source_available(job.source.location, source_type_val):
-            raise ValueError(
-                f"Source media is unavailable: {job.source.location}. "
-                "Restore the file and reopen, or re-transcribe."
-            )
-        try:
-            same_source = Path(artifact_source).resolve().samefile(
-                Path(job.source.location)
-            )
-        except OSError:
-            # The recorded source path no longer exists on disk.
-            same_source = False
-        if not same_source:
-            raise ValueError("Artifact source path does not match job source")
-        # Fingerprint validation.
-        #
-        # The artefact carries the *exact* fingerprint inputs that produced it
-        # (``fingerprint_settings`` / ``fingerprint_source_type`` /
-        # ``fingerprint_schema_version``).  Recomputing without them hashes a
-        # different payload, so a real adapter-written artefact would never
-        # match and every REAL reopen would be rejected.  Re-derive from the
-        # artefact's own inputs instead.
-        artifact_fp = str(data.get("fingerprint", "") or "")
-        artifact_mode = str(data.get("mode", "") or "")
-        fingerprint_settings = data.get("fingerprint_settings")
-        fingerprint_source_type = str(data.get("fingerprint_source_type", "") or "")
-        try:
-            fingerprint_schema_version = int(data.get("fingerprint_schema_version", 0) or 0)
-        except (TypeError, ValueError):
-            fingerprint_schema_version = 0
-
-        # A legacy artefact (pre-contract: no canonical fingerprint, or none
-        # of the new keys) is unverifiable.  It is refused explicitly instead
-        # of being silently accepted or silently repaired.
-        if not is_canonical_fingerprint(artifact_fp):
-            raise ValueError("Legacy transcript artifact - re-transcribe required")
-        if not isinstance(fingerprint_settings, dict) or not fingerprint_settings:
-            raise ValueError("Legacy transcript artifact - re-transcribe required")
-        if not fingerprint_source_type or fingerprint_schema_version <= 0:
-            raise ValueError("Legacy transcript artifact - re-transcribe required")
-
-        # Mode match: the artefact must describe the same mode as the job it
-        # is reopened as.  A narrator artefact must never be opened as exact
-        # dubbing and vice versa.
-        if artifact_mode != mode.value:
-            raise ValueError(
-                f"Artifact mode {artifact_mode!r} does not match job mode {mode.value!r}"
-            )
-
-        # Artifact path containment: the artefact must resolve inside this
-        # job's own source directory.  A job id or source path that would
-        # place the artefact outside the repository (for example a job id
-        # containing path separators) is refused instead of being read.
-        try:
-            artifact_path.resolve().relative_to(
-                self._job_repository._source_dir(source_path).resolve()
-            )
-        except ValueError:
-            raise ValueError("Transcript artifact is outside the job directory")
-
-        current_fp = compute_fingerprint(
-            source_path,
-            fingerprint_source_type,
-            mode,
-            settings=dict(fingerprint_settings),
-            schema_version=fingerprint_schema_version,
-        )
-        if artifact_fp != current_fp:
-            raise ValueError("Fingerprint mismatch between artifact and current source")
-        # rows validation
-        rows_raw = data.get("rows", [])
-        if not isinstance(rows_raw, list) or not rows_raw:
-            raise ValueError("Transcript artifact contains no rows")
-        from ..domain.models import TranscriptRow, VideoSource, ProjectSession
-        rows = []
-        seen_ids = set()
-        try:
-            artifact_duration = float(data.get("duration_s", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            artifact_duration = 0.0
-        for r in rows_raw:
-            try:
-                row_id = str(r["row_id"])
-                start = float(r["start"])
-                row_duration = float(r["duration"])
-                text = str(r["text"])
-            except Exception as exc:
-                raise ValueError(f"Invalid transcript row: {exc}")
-            if not row_id:
-                raise ValueError(f"Empty row_id in transcript artifact")
-            if row_id in seen_ids:
-                raise ValueError(f"Duplicate row_id {row_id} in transcript artifact")
-            seen_ids.add(row_id)
-            if not (math.isfinite(start) and start >= 0):
-                raise ValueError(f"Invalid start time for row {row_id}: {start}")
-            if not (math.isfinite(row_duration) and row_duration > 0):
-                raise ValueError(f"Invalid duration for row {row_id}: {row_duration}")
-            end = start + row_duration
-            if not math.isfinite(end):
-                raise ValueError(f"Invalid end time for row {row_id}: {end}")
-            if artifact_duration > 0 and end > artifact_duration + 0.01:
-                raise ValueError(f"Row {row_id} end {end}s exceeds artifact duration {artifact_duration}s")
-            rows.append(TranscriptRow(row_id=row_id, start=start, duration=row_duration, text=text))
-        # Build the session WITHOUT applying it: the caller applies it on the
-        # GUI thread so the project is never mutated from a worker thread.
-        source = VideoSource.local(job.source.location)
-        output_folder = str(job_dir.parent.parent)
-        session = ProjectSession(source=source, output_folder=output_folder, mode=mode, is_demo=False)
-        return session, rows, str(data.get("language", ""))
+        return self._jobs.prepare_transcript_from_job(job_id, source_path)
 
     def open_transcript_from_job(self, job_id: str, source_path: str) -> None:
         """Load a completed REAL transcript artifact into the workspace with strict validation.
@@ -771,6 +868,17 @@ class AppContext(QObject):
             self.jobs.add(job)
         self.jobUpdated.emit(job)
 
+    def _reset_transcript_progress_after_persistence_failure(self, exc: Exception) -> None:
+        """Never leave a stale 100% progress bar after a persistence failure."""
+        self.transcriptProgress.emit(
+            ProgressEvent(
+                percent=0.0,
+                stage=Stage.TRANSCRIBE,
+                message="Transcript wrote, but job metadata could not be persisted; restart required.",
+            )
+        )
+        self._set_transcript_state("failed", f"Failed to persist transcript job: {exc}")
+
     def _on_transcript_result(self, rows, language) -> None:
         if (self.session is not self._transcript_session
                 or self.session.source is None
@@ -784,34 +892,10 @@ class AppContext(QObject):
         # Persist Job metadata for restart discovery
         if self._job_repository is not None:
             try:
-                from ..domain.enums import JobState
-                from ..domain.fingerprint import FINGERPRINT_SCHEMA_VERSION
-                from ..domain.models import Job, JobProgress, VideoSource
-                from ..infrastructure.repository.job_repository import compute_fingerprint
-                source_path = provider.source_path
-                mode = provider.mode
-                job_id = provider.job_id
-                source_type = self.session.source.source_type.value if self.session.source else ""
-                fp = getattr(provider, "fingerprint", "") or compute_fingerprint(
-                    source_path, source_type, mode, schema_version=FINGERPRINT_SCHEMA_VERSION
-                )
-                artifact_path = str(provider.artifact_path) if hasattr(provider, "artifact_path") else ""
-                job = Job(
-                    job_id=job_id,
-                    title=Path(source_path).name,
-                    mode=mode,
-                    state=JobState.COMPLETE,
-                    is_demo=False,
-                    source=VideoSource.local(source_path),
-                    progress=JobProgress(percent=100.0),
-                    fingerprint=fp,
-                    output_path=artifact_path,
-                    artifact_path=artifact_path,
-                )
-                self._job_repository.save(job, source_path)
+                job = self._jobs.persist_completed_transcript(provider)
                 self._register_job(job)
             except Exception as exc:
-                self._set_transcript_state("failed", f"Failed to persist transcript job: {exc}")
+                self._reset_transcript_progress_after_persistence_failure(exc)
                 self.append_log(LogEntry(stage=Stage.TRANSCRIBE, message=f"Job persistence failed: {exc}"))
                 return
         self._set_transcript_state("complete", f"REAL transcript: {len(rows)} rows, language={language}. Artifact: {provider.artifact_path}. Narrator plan not generated.")

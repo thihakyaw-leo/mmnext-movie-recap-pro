@@ -148,14 +148,24 @@ def test_same_stem_sources_and_modes_have_isolated_artifacts(tmp_path):
 
 
 def test_optional_real_local_transcript(tmp_path):
-    """Opt-in only: do not download models or touch arbitrary user media."""
+    """Opt-in only: do not download models or touch arbitrary user media.
+
+    Use the *full-speech* fixture, not an artificially clipped one.  A clip
+    cuts an utterance in half, so Whisper's final segment legitimately ends
+    after the clip boundary; the strict adapter rejects that on purpose and
+    this test must fail for a clipped source.  The accepted fixture keeps the
+    complete recording, so every row ends inside the authoritative duration
+    with zero tolerance.
+    """
     import importlib.util
     import os
     import shutil
     media = os.environ.get("MMNEXT_TRANSCRIPT_SMOKE_MEDIA")
     model = os.environ.get("MMNEXT_TRANSCRIPT_SMOKE_MODEL")
     if not media or not model:
-        pytest.skip("Provide an approved media fixture and a local cached Whisper model directory for real smoke")
+        pytest.skip(
+            "Provide an approved media fixture and a local cached Whisper model directory for real smoke"
+        )
     if not Path(media).is_file() or not Path(model).is_dir():
         pytest.skip("Local media/model fixture unavailable")
     if not shutil.which("ffprobe") or not shutil.which("ffmpeg") or not importlib.util.find_spec("faster_whisper"):
@@ -164,6 +174,7 @@ def test_optional_real_local_transcript(tmp_path):
     rows, language = adapter.transcribe(media, auto_detect=True)
     assert adapter.artifact_path.exists()
     assert language and isinstance(rows, list)
+    # Zero tolerance: every row must end inside the authoritative duration.
     assert rows and all(0 <= r.start < r.end <= adapter._duration for r in rows)
     assert checkpoint(adapter, Path(media))["state"] == "complete"
 

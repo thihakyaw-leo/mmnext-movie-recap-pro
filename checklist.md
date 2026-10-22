@@ -802,10 +802,12 @@ This update supersedes earlier missing-tools/media notes; it does not mark the t
 - [x] Installed optional local runtime into this project `.venv`: faster-whisper 1.2.1, CTranslate2 4.8.3, static-ffmpeg 3.0 and dependencies. PyAV 19.0.1 failed with `TypeError: open() got an unexpected keyword argument metadata_errors`; pinned PyAV 16.1.0 and reran successfully through inference. Exact tested versions: `.work/transcript-acceptance/requirements-tested.txt`.
 - [x] Downloaded FFmpeg/FFprobe into `.work/transcript-acceptance/win32`. Test explicitly prepends this directory to process PATH only. No system installation or persistent PATH modification. Local CPU/int8 model: `.work/transcript-acceptance/models/tiny.en` (Systran/faster-whisper-tiny.en).
 - [x] Used public reusable speech, not personal media: Real Python `audio_files/harvard.wav`, https://github.com/realpython/python-speech-recognition (MIT repository; license retained in `inputs/REALPYTHON-LICENSE.txt`). Attribution and download URL: `.work/transcript-acceptance/SOURCE.txt`. First 12 seconds muxed with a generated black 320x180 video at `.work/transcript-acceptance/inputs/osr-harvard-12s.mp4`. The filename's OSR prefix is historical; the actual downloaded recording is Real Python harvard.wav, not the blocked OSR recording. Original OSR host returned HTTP 406.
-- [x] Real adapter ran with `is_demo=False`, local model and no inference network. FFprobe measured 12.000s; extracted audio verified mono 16000 Hz PCM16, 12.000s. Four nonempty English rows persisted with unique IDs and a COMPLETE checkpoint. Last recorded inference: 2.833s. Actual first text: "The stale smell of old beer lingers."
-- [ ] **Strict acceptance FAILED, exit 1**: row s3 starts at 10.000s with duration 3.000s, ending 13.000s, beyond authoritative 12.000s video and 0.25s test tolerance. Adapter still records COMPLETE and progress 100%. Do not interpret that checkpoint as acceptance success. No rows were clamped, dropped, merged or edited to hide the problem. Evidence: `.work/transcript-acceptance/acceptance-result.json` and `acceptance.log`.
-- [x] Full suite with real opt-in media/model enabled: **272 passed, 1 failed in 74.68s**, exit 1. Failure: `test_worker_checkpoint_round_trip_through_repository` assumes pytest tmp_path is outside cwd; keeping test temp inside project conflicts with that assumption. Isolated rerun from a task subdirectory, still keeping all outputs inside MMNext: that test plus `test_optional_real_local_transcript` **2 passed in 2.95s**, exit 0. This is NOT a clean full-suite rerun. Logs: `pytest.log` and `pytest-isolated.log` in the same task folder.
-- [ ] Existing opt-in real smoke only checks artifact existence, language and rows-list type. It passes despite the timing defect; stronger bounded-timestamp regression and production completion validation remain necessary.
+- [x] Real adapter ran with `is_demo=False`, local model and no inference network. FFprobe measured 12.000s; extracted audio verified mono 16000 Hz PCM16, 12.000s. Historical artifact/checkpoint from a prior weaker runner exists, but the current strict adapter did NOT commit COMPLETE: `test_optional_real_local_transcript` failed at `adapter.transcribe` with `Whisper segment s3 [10.0, 13.0] exceeds authoritative video duration 12.0s`; no invalid artifact was committed. Last recorded inference: 2.833s. Actual first text: "The stale smell of old beer lingers."
+- [ ] **Strict acceptance FAILED**: row s3 starts at 10.000s with duration 3.000s, ending 13.000s, beyond authoritative 12.000s video and 0.25s test tolerance. Current strict adapter rejects before commit and raises `RuntimeError`; the historical `acceptance-result.json`/`acceptance.log` still show a COMPLETE checkpoint only as dated evidence that must not be interpreted as acceptance success. No rows were clamped, dropped, merged or edited to hide the problem.
+  - **Superseded by § T (2026-10-22):** the rejected source is a *clipped* fixture, not a model defect. The full-speech fixture passes strict acceptance with zero tolerance and no source row altered.
+- [ ] Full suite with real opt-in media/model enabled: `test_optional_real_local_transcript` fails for the same timing defect; all other suite tests pass (`384 passed, 1 skipped` with opt-in disabled). Strict end-to-end acceptance remains unverified.
+  - **Superseded by § T (2026-10-22):** with the full-speech fixture the opt-in test passes; the clipped fixture still fails on purpose.
+- [ ] Existing opt-in real smoke only checks artifact existence, language and rows-list type. Stronger bounded-timestamp regression and production completion validation remain necessary.
 - [ ] Real-media-to-live-UI binding was not exercised in this acceptance task. Persisted reopening/Jobs recovery, Router review, translation, TTS and final rendering remain unverified or out of scope.
 - [x] Production Python source and tests were not changed. Only the project venv, task-local tools/models/fixture/QA artifacts and this checklist were changed; neither legacy project was accessed or modified.
 
@@ -1004,4 +1006,105 @@ Next action: reject/report model timestamps outside authoritative media duration
 - **Gemini story context, translation batching, checkpoint, audit** хэрэглээгүй. `TranslationProvider` нь `context` ба `glossary` параметрүүдийг авдаг ч одоогийн demo adapter-ууд тэдгээрийг ашиглахгүй.
 - **Batch-folder queue, narration editor save/re-render, translation audit findings, final video validation, output reveal** хэрэглээгүй (§ Phase 4-ийн үлдсэн item-үүд).
 - **Exact Dubbing, Splitter, Common Editing** босоо slice-ууд хэвээр дутуу.
+
+
+## S. UI→infrastructure isolation and code-review debt cycle — баталгаажилсан төлөв (2026-10-21)
+
+Энэ хэсэг нь UI-ийн техникүүдийг infrastructure-руу шууд хүрэхгүйгээр application-layer facade-аар дамжуулах дараагийн code-review debt slice-ийн **бодитогоор ажиллуулж баталгаажуулсан** төлөв юм. § O, § P, § Q, § R-ийн хуучин бичлэгүүдийг устгаагүй; дээрх "Одоо ч үнэн биш байгаа зүйлс"-ийн зөвхөн энэ хэсгээр орлох хэсгийг энд тодорхойлж заана.
+
+### Өөрчилсөн ба шинэ файлууд
+
+- `mmnext/application/job_service.py` (**шинэ**) — Qt-гүй application facade. Owner of `JobRepository`, public `source_dir()` / `job_dir()` / `checkpoint_path()` helpers, job scan/load/save, canonical fingerprint helper, `create_transcript_provider()`, `prepare_transcript_from_job()`, and `persist_completed_transcript()`.
+- `mmnext/application/runtime_service.py` (**шинэ**) — `detect_dependencies()`-ийг application-layer facade болгож, `MainWindow`-ийг infrastructure-руу шууд хүрэхгүй болгосон.
+- `mmnext/application/player_service.py` (**шинэ**) — `create_player`, `player.info`, `PlaceholderPlayer` type/tick semantics-ийг application-layer facade болгож, `PreviewPanel`-ийг infrastructure-руу шууд хүрэхгүй болгосон.
+- `mmnext/domain/errors.py` (**шинэ**) — `TranscriptStopped` domain exception; infrastructure raise, UI catch, тэдгээр нь infra классруу шууд харагдахгүй.
+- `mmnext/infrastructure/transcript_adapter.py` — `TranscriptStopped` одоо `mmnext.domain.errors`-ээс импорт хийж `__all__`-д нээлттэй байна; `WhisperTranscriptAdapter` нь `repo._job_dir(...)` оронг `repo.job_dir(...)` **public** method-руу солилоо.
+- `mmnext/infrastructure/repository/job_repository.py` — `source_dir()`, `job_dir()`, `checkpoint_path()` нэмэгдсэн. Private helper-үүд нь дотоод хэрэглээнд хадгалагдсан; UI/application-ийн дуудлага private API-г ашиглахгүй.
+- `mmnext/ui/app_context.py` — `JobService` / `RuntimeService`-ийг эзэмшдэг; `_job_repository` нь facade-д delegate хийгддэг property боллоо; `start_local_transcript()` нь `JobService`-ээр provider авна; `prepare_transcript_from_job()` буцах validation-ийг `JobService`-д delegate хийсэн; transcript job persistence нь `JobService.persist_completed_transcript()`-р ажиллана; persistence failure нь `_reset_transcript_progress_after_persistence_failure()`-р progress-ийг `0.0` + failed state-руу буцаана.
+- `mmnext/ui/main_window.py` — dependency chips одоо `context.detect_dependencies()`-ийг дуудана.
+- `mmnext/ui/workspace/preview.py` — `PlayerService`-ийг ашиглана; `PlayerInfo`, `PlaceholderPlayer`, `create_player`-руу шууд import хийхгүй.
+- `mmnext/ui/workers.py` — `DownloadWorker` нь `JobService.checkpoint_path()`-ийг дуудаж `_checkpoint_path` private helper-гүй repo ашигладаг.
+- `mmnext/ui/transcript_worker.py` — `TranscriptStopped`-ийг `domain.errors`-ээс авдаг.
+
+### Code-review debt засагч
+
+- [x] **UI အရမှ infrastructure import-г болив.** `tests/test_architecture_gates.py::test_ui_layer_does_not_import_infrastructure` AST parse хийж relative/absolute infrastructure import-г бүх `mmnext/ui/**/*.py` файлд илрүүлнэ.
+- [x] **Private repository path API integration-ийг болив.** `test_ui_layer_does_not_call_private_repository_path_helpers` нь `_source_dir(`, `_job_dir(`, `_checkpoint_path(` шууд текст marker-ийг UI-д илрүүлнэ. Production application worker нь public `JobService` methods ашигладаг.
+- [x] **Adapter fingerprint == artifact fingerprint.** `tests/test_fingerprint.py::test_adapter_checkpoint_fingerprint_equals_artifact_fingerprint` нь `adapter.fingerprint`-ийн утгыг `translated_gender.json`/transcript artifact-ийн `payload["fingerprint"]`-тай **директ тааруулж** шалгадаг; checkpoint-ийн bus shuu fingerprint settings-ууд ч мөн адил тааруулагдана.
+- [x] **Persistence failure нь хуучин 100%-ийг үрүүлэхгүй.** `AppContext._reset_transcript_progress_after_persistence_failure()` нь `ProgressEvent(percent=0.0)` үүсгэж, дараа нь `failed` state-г тохируулна. `tests/test_live_transcript_workspace.py::test_job_persistence_failure_is_visible_and_not_silent` нь `transcript_progress.value() == 0` of active enable state `transcribe_button.isEnabled()`-ийг мөн шалгадаг.
+
+### Задлан шалгасан үр дүн
+
+- `.\.venv\Scripts\python.exe -m pytest tests/test_architecture_gates.py tests/test_job_service.py tests/test_fingerprint.py -q --confcutdir=tests` → **57 passed in 2.81s**.
+- `.\.venv\Scripts\python.exe -m pytest tests/test_live_transcript_workspace.py tests/test_transcript_open.py tests/test_transcript_reopen_thread.py tests/test_job_repository.py tests/test_workers.py -q --confcutdir=tests` → **80 passed in 16.33s**.
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **391 passed, 1 skipped in 90.87s**. `skip`: `tests/test_transcript_regressions.py:158`.
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 дэлгэц, `closed`, exit 0.
+
+### Одоо ч үнэн биш байгаа зүйлс
+
+- Бодит Whisper smoke (`MMNEXT_TRANSCRIPT_SMOKE_MEDIA` + `MMNEXT_TRANSCRIPT_SMOKE_MODEL`) хэрэглэгчийн fixture/model тохиргоогүйгээр хуучин `1 skipped` байна.
+- Real narrator adapter wiring (`Gemini`, `edge_tts`, legacy render entry point) хэвээр DEMO байна; test suite нь зөвхөн демонстрацион pipeline-ийг хамрагчдаг.
+- Репо-д `.git` байхгүй тул branch/commit/PR нотолгоо байхгүй; энэ slice-ийн нотолгоо нь дээрх test command-ууд болон архитектур gate-ууд юм.
+
+
+## T. Strict real-media Whisper acceptance — full-speech fixture နဲ့ ဖြေပြည့်ပြီး (2026-10-22)
+
+§ M နဲ့ § N မှာ "Strict acceptance FAILED" လို့ မှတ်ထားခဲ့သော ရလဒ်ကို **ပိုးမွေးပြီး ဖြေပြည့်ပါပြီ**။ အချက်အနှောက်က acceptance media ကို **မှားယှာ ရွေးခဲ့သခြင်း** ဖြစ်ပါတယ်။ Source rows ကို clamp/drop/merge/retime လုပ်ခြင်း **မလုပ်**ထားပါ။
+
+- [x] **အချက်အနှောက်:** နောက်ဆုံးမှတ်ထားခဲ့သော `inputs/osr-harvard-12s.mp4` က **clipped** fixture ဖြစ်ပါတယ် — 18.356s ရှိ `harvard.wav` ကို ၁၂ စက္ကန့်မှာ ဖြတ်ထားသဖြင့် နောက်ဆုံး utterance တစ်ခုတည်း ပြတ်နေပါတယ်။ ဖြတ်ထားသော အစွန်းတွင် Whisper ရဲ့ နောက်ဆုံး segment က clip boundary ကို ကျော်တာ ဖြစ်လို့ `[10.0, 13.0]` က 12.0s ထက် ကျော်ပါတယ်။ ဒါက model bug မဟုတ် — မှားယှာ ရွေးခဲ့သော fixture ပါ။
+- [x] **မှန်တကယ်တဲ့ acceptance media:** `inputs/harvard-full.mp4` — `harvard.wav` အပြည့် speech (18.356190476s) ကို black video ထဲ mux ထားသည့်၊ authoritative duration **18.357s**။ အပြည့်အစုံ speech ဖြစ်လို့ နောက်ဆုံး segment က အစွန်းအတွင်းပါသည်။
+- [x] **Canonical runner PASS:** `.work/transcript-acceptance/boundary_acceptance.py` → `boundary-acceptance-result.json` တွင် `status: PASS`၊ `timing_tolerance_s: 0`၊ `clipped_rejection: PASS` (clipped fixture ကို strict ငြင်းခြင်း ဆက်လက် အတည်ပြီး)၊ `full_source: PASS` (6 rows၊ နောက်ဆုံး end **17.600s** ≤ 18.357s၊ inference 2.051s၊ audio mono/16 kHz/PCM16 18.357s)၊ `real_ui: PASS` (offscreen REAL button → QThread → real FFmpeg/Whisper → 6 rows၊ REAL badge၊ progress 100၊ Exact Dubbing blank translation ကြောင့် validation ပိတ်ထားမှု မှန်)။
+- [x] **Opt-in test ကို တိကျအောင် ပြင်ဆင်ခဲ့:** `tests/test_transcript_regressions.py::test_optional_real_local_transcript` ရဲ့ docstring က *full-speech* fixture ကိုသာ သုံးရမည် ဖော်ပြပြီး "zero tolerance" အောင် ရှင်းလင်းချက် ထည့်ထားပါတယ်။ Clipped source နဲ့ test က fail ဖြစ်တာ မှားမဟုတ် — ဒါက ပိုးမွေးနေသော strict rejection ပါ။
+- [x] **Source rows မပြောင်းထားပါ။** Row တစ်ခုချင်းစီရဲ့ id/start/duration/text က မူလ မြင့်ကြီးနဲ့တူပါတယ်။ လုံးဝ မဖြတ်၊ မပြောင်း၊ မ merge မလုပ်ထားပါ။
+
+### Задлан шалгасан үр дүн
+
+- `.\.venv\Scripts\python.exe .work\transcript-acceptance\boundary_acceptance.py` → `status: PASS`, tolerance 0 စက္ကန့်၊ clipped rejection PASS၊ full source PASS၊ offscreen real UI PASS။
+- `.\.venv\Scripts\python.exe -m pytest tests/test_transcript_regressions.py::test_optional_real_local_transcript -q --confcutdir=tests` (env: `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en`) → **1 passed in 26.59s**။
+- Clipped fixture နဲ့ တိုင်းစစ်ခြင်း → ရိုးသား ငြင်းပါတယ် (`RuntimeError: Whisper segment s3 [10.0, 13.0] exceeds authoritative video duration 12.0s`)။
+
+### ဆက်လက် မှားမှတ်ထားသင့်သောအချက်
+
+- Strict timing validation **မပြောင်းထားပါ**။ Overshoot ဖြစ်သော နောက်ဆုံး segment ကို clamp/drop လုပ်တာ မလုပ်ထားသဖြင့် strictness ဆက်လက် အစိမ်းအမှန်ပါ။
+- လက်ရှိ opt-in test က တစ်ခုတည်း media ကိုသာ သုံးပါတယ်။ အများအပြား media နဲ့ (အများဆိုရင် ကလီပ်ချထားသော အသံ) strict acceptance က မဖြစ်နိုင်သလို သတိပေးရမည်။
+
+
+## U. Exact Dubbing TTS / render / cache နဲ့ final validation (2026-10-22)
+
+`translated_gender.json` ကနေ စတင်ပြီး Exact Dubbing ကို REAL render လုပ်နိုင်အောင် လုပ်ထားသော vertical slice။ Legacy `J:\movie-recap` ကို **ဖတ်ခဲ့သား** (read-only contract)၊ ဖိုင်များ မဖြတ်ခြင်း၊ copy မလုပ်ခြင်း။ Contract ကို native အသစ်ဖြင့် အသုံးပြုထားပါတယ်။
+
+### အသစ်ဖြင့်ဖန်တီး/ပြင်ဆင်ခဲ့သောဖိုင်များ
+
+- `mmnext/domain/exact_dubbing.py` (**အသစ်**) — pure domain contract။ `translated_gender.json` schema စစ်ခြင်း (JSON array, `id`/`start`/`duration`/`original`/`burmese`/`gender`)၊ Myanmar Unicode regex `[\u1000-\u109f\uaa60-\uaa7f]`၊ gender → voice mapping (`male` → `my-MM-ThihaNeural`, `female`/`unknown` → `my-MM-NilarNeural`)၊ immutable source check (timing tolerance `1e-6`)၊ `speech_window()` (legacy rule: နောက်ဆုံး row ရဲ့ gap ကို 80 % အထိ ချဲ့၊ နောက်ဆုံး row ကို media အဆုံးနဲ့ clamp)၊ `atempo_chain()` (>2× ကို chain ခွဲ)၊ `cache_signature()` (`sha256(voice + "\n" + text)`)။ Qt/application/infrastructure import မရှိ။
+- `mmnext/services/adapters/exact_dubbing_tts.py` (**ပြန်ရေးခဲ့**) — `LegacyExactDubbingTtsAdapter` (Edge TTS, retry ladder 6 ခု / 5-10-20-40-60 စက္ကန့်, `.partial` + atomic rename, `.sha256` sidecar) နဲ့ `LocalWaveTtsAdapter` (offline၊ အမှန်တကယ် PCM WAV ထုတ်၊ အလျားပြုချက် = စကားရှည်နဲ့ ကြာချိန်)။ Cache signature က voice + text ပဲ ပါတယ် — rate ပြောင်းလဲမှုက ကုန်နှင့်ကို မဖျက်ပါ။
+- `mmnext/infrastructure/exact_dubbing_render.py` (**အသစ်**) — `FfmpegExactDubbingRenderer`။ moviepy မလိုတော့။ (1) `atempo` chain နဲ့ locked window ထဲသို့ fit (FFmpeg sample rounding ကြောင့် `target + 0.04` ကျော်ရင် ဒုတိယ correction pass)၊ (2) 44100 Hz အတိအကျ timeline ပေါ်တွင် numpy memmap နဲ့ bounded mix (စကားမရှိသော နေရာ ငြိမ်သက်)၊ (3) source video ကို မဖြတ်ဘဲ mux (`h264_nvenc` → `libx264` fallback)၊ (4) FFprobe နဲ့ duration + audio stream + video stream validation ကျော်မှ မဟုတ်မှ `.partial` → final rename မလုပ်ပါ။
+- `mmnext/application/exact_dubbing_service.py` (**အသစ်**) — application facade။ UI က infrastructure ကို တိုက်ရိုက် မလုပ်ရ။ `render_from_translated_gender()` က `translated_gender.json` ကို အရင် သိမ်းပြီး source rows နဲ့ တိကျစစ်ပြီးမှ render စတင်ပါတယ်။
+- `mmnext/application/exact_dubbing_render_coordinator.py` — rate နဲ့ re-synthesis ကို ဖယ်ရှားပြီး (fit ကို renderer ရဲ့ `atempo` က လုပ်သဖြင့်) final validation မှာ **audio-stream check** ထည့်ခဲ့ပါတယ်။
+- `mmnext/ui/app_context.py` — `ExactDubbingService` facade ကို သုံးရင်း renderer/TTS ကို ရွေးပါတယ်။ `export_exact_dubbing()` က အခု legacy-compatible ဖြစ်အောင် `id` က **positional int index** ဖြစ်ပြီး source row id ကို အပိုးအပိုး `row_id` key အဖြစ် ထည့်ပါတယ် (legacy reader အပိုးအပိုး key ကို လက်ခံပါတယ်)။
+- `tests/test_exact_dubbing_render.py` (**အသစ်**, 20 tests) — domain schema/validation, cache, နဲ့ **real FFmpeg render** (video ထုတ် → WAV synthesize → fit → mix → mux → ffprobe validate)။
+
+### အတည်ပြချက်
+
+- [x] **Source rows ဘယ်တော့မှ မပြောင်းထားပါ။** `id`/`original`/`start`/`duration` က locked။ Render test က row snapshot ကို render မတိုင်မီ/ပြီး နှစ်ဖက် တူညီကြောင်း စစ်ပါတယ်။
+- [x] **Drift ဖြစ်တဲ့ translation ကို ငြင်းပါတယ်။** `start` ပြောင်းတဲ့ translation → speech မစတင်ခင်း `ValueError: changed start`၊ final file မရှိ။
+- [x] **Final duration + audio-stream validation အလုပ်လုပ်ပါတယ်။** Renderer က FFprobe နဲ့ duration (`max(0.1s, 1/fps)`)၊ audio stream၊ video stream သုံးခုလုံး စစ်ပြီးမှ final file ထုတ်ပါတယ်။ Coordinator ကလည်း output ပေါ်တွင် audio-stream check ကို ထပ်စစ်ပါတယ်။
+- [x] **Cache အလုပ်လုပ်ပါတယ်။** စကား/voice မပြောင်းရင် cache hit (file mtime မပြောင်း)၊ စကား ပြောင်းရင် invalidate။
+- [x] **UI က infrastructure ကို တိုက်ရိုက် မလုပ်ပါ။** `test_ui_layer_does_not_import_infrastructure` က ဆက်လက် အောင်မြင်ပါတယ်။
+
+### နောက်တစ်ဆင့်ကို မှန်တကယ် မလုပ်ရသေးသောအချက်
+
+- **အသံက DEMO ပါ။** ဒီ venv မှာ `edge_tts` မရှိလို့ `LocalWaveTtsAdapter` (synthetic tone) ကို သုံးနေပါတယ်။ အသံပိုင်းက **မှန်တကယ် Burmese အသံ မဟုတ်**။ Renderer/fit/mix/mux/validation တိုင်း REAL ပါ။ Run ကို DEMO အဖြစ် ရှင်းလင်း အမှတ်ပြုထားပါတယ်။
+- **Real Edge TTS run မလုပ်နိုင်ပါ။** Network မရှိတဲ့ test environment ကြောင့် `LegacyExactDubbingTtsAdapter` (retry ladder ပါ) ကို ဒီ environment မှာ run မလုပ်နိုင်ပါ။
+- **Legacy pipeline ကို subprocess နဲ့ wrap လုပ်ခဲ့သော path မရှိပါ။** Native implementation ကို အသုံးပြုထားပြီး၊ legacy project ကို ဖိုင်မွေး/တည်းဖြတ်ခြင်း မရှိပါ။
+- **Speed-fit warning သာ ရှိပြီး cap မရှိ။** 1.35× ကျော်ရင် warning ပဲ၊ fit ကို ဆက်လုပ်ပါတယ် (legacy အတူ)။
+- **Splitter / Common Editing / Narrator heavy integration** က မလုပ်ရသေးပါ။
+
+### နောက်ဆုံး စစ်ဆေးချက်
+
+- `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py tests/test_exact_dubbing_panel.py tests/test_exact_dubbing_validation_gate.py tests/test_transcript_regressions.py tests/test_architecture_gates.py -q --confcutdir=tests -p no:cacheprovider` → **82 passed, 1 skipped in 16.86s**။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **412 passed, 1 skipped in 103.23s**။
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
+- `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en` ဖြင့် opt-in real smoke → **1 passed in 7.80s**။
+
+
 
