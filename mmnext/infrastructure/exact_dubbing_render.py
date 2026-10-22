@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from ..domain.exact_dubbing import atempo_chain, speech_window
+from .ffmpeg_tools import FfmpegTools
 from ..domain.models import ExactDubbingRow
 from ..services.protocols import ExactDubbingRenderer
 
@@ -97,6 +98,9 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         self.log = log or (lambda msg: None)
         self.work_dir = Path(work_dir) if work_dir else None
         self.timeout_s = int(timeout_s)
+        self._tools = FfmpegTools(
+            ffmpeg=ffmpeg, ffprobe=ffprobe, timeout_s=timeout_s, log=self.log
+        )
         self._stage = "idle"
         #: The reason of the last failure.  The coordinator reports it so a
         #: REAL failure is never reduced to a generic "Render failed".
@@ -114,108 +118,33 @@ class FfmpegExactDubbingRenderer(ExactDubbingRenderer):
         return {"stage": self._stage, "percent": 0.0}
 
     # -- FFmpeg helpers ----------------------------------------------------- #
+    # The tool invocation and the probe readers live on the shared
+    # `FfmpegTools` so every renderer applies the same rules.
     def _run(self, command: Sequence[str], timeout: Optional[int] = None) -> str:
-        """Run a tool and return its stdout.  Raises on a non-zero exit."""
-        started = time.perf_counter()
-        name = Path(command[0]).name
-        self.log(f"run: {name}")
-        try:
-            completed = subprocess.run(
-                list(command),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout or self.timeout_s,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"{name} timed out after {timeout or self.timeout_s}s"
-            ) from exc
-        except OSError as exc:
-            raise RuntimeError(f"{name} could not be started: {exc}") from exc
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            raise RuntimeError(
-                f"{name} failed ({completed.returncode}): {detail[-800:]}"
-            )
-        self.log(f"done: {name} in {time.perf_counter() - started:.2f}s")
-        return completed.stdout or ""
+        return self._tools.run(command, timeout)
 
     def _probe(self, path: str | Path) -> dict:
-        payload = self._run(
-            [
-                self.ffprobe,
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-of",
-                "json",
-                str(path),
-            ],
-            timeout=120,
-        )
-        try:
-            data = json.loads(payload or "{}")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"ffprobe returned unreadable JSON for {path}") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError(f"ffprobe returned an unexpected document for {path}")
-        return data
+        return self._tools.probe(path)
 
     @staticmethod
     def _duration(info: dict) -> float:
-        try:
-            return float(info.get("format", {}).get("duration", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        return FfmpegTools.duration(info)
 
     @staticmethod
     def _stream_duration(info: dict, codec_type: str) -> float:
-        """Return the duration of the first stream of ``codec_type``."""
-        for stream in info.get("streams", []):
-            if stream.get("codec_type") != codec_type:
-                continue
-            for key in ("duration", "duration_ts"):
-                value = stream.get(key)
-                if value in (None, "", "N/A"):
-                    continue
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
-        return 0.0
+        return FfmpegTools.stream_duration(info, codec_type)
 
     @staticmethod
     def _has_audio_stream(info: dict) -> bool:
-        return any(
-            stream.get("codec_type") == "audio" for stream in info.get("streams", [])
-        )
+        return FfmpegTools.has_audio_stream(info)
 
     @staticmethod
     def _has_video_stream(info: dict) -> bool:
-        return any(
-            stream.get("codec_type") == "video" for stream in info.get("streams", [])
-        )
+        return FfmpegTools.has_video_stream(info)
 
     @staticmethod
     def _frame_rate(info: dict) -> float:
-        for stream in info.get("streams", []):
-            if stream.get("codec_type") != "video":
-                continue
-            for key in ("avg_frame_rate", "r_frame_rate"):
-                value = str(stream.get(key) or "")
-                if "/" in value:
-                    num, _, den = value.partition("/")
-                    try:
-                        num_f, den_f = float(num), float(den)
-                    except ValueError:
-                        continue
-                    if num_f > 0 and den_f > 0:
-                        return num_f / den_f
-        return 0.0
+        return FfmpegTools.frame_rate(info)
 
     # -- fitting ------------------------------------------------------------ #
     def _fit_row(

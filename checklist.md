@@ -1155,6 +1155,51 @@ Independent review က exact-dubbing slice ကို စစ်ဆေးပြီ
 - `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
 
 
+## X. Splitter mode integration — REAL FFmpeg parts (2026-10-23)
+
+Splitter slice။ UI (panel + `AppContext` + worker thread) က အခြားသော လုပ်ငန်းတွင် ရေးပြီးဖြစ်သဖြင့် ဤ slice က **planner ကို ချိန်ညှိပြီး**၊ **REAL renderer ကို အသစ်တည်ဆောက်ပြီး**၊ **တင်ဆက်ချိန်ညှိချက်များကို တိကျပြောပြပြီး**၊ နောက်ဆုံးတွင် **test များ ပြည့်စုံအောင် ဖြည့်ဆင်းခဲ့သည်** (ယခင်က splitter test **သုည** ဖြစ်ခဲ့သည်)။
+
+### ဖိုင်များ
+
+- `mmnext/infrastructure/ffmpeg_tools.py` (**အသစ်**) — FFmpeg/FFprobe invocation, probe reads (duration / stream duration / start_time / frame rate / stream presence) နှင့် `validate_media()` final check တို့ကို **တစ်နေရာတည်း** သို့ ရွှေ့ပြီး။ UTF-8 decode + timeout ကို အားလုံးတွင် တစ်ပြိုင်နက်တည်း အသုံးပြုသည်။
+- `mmnext/infrastructure/splitter_render.py` (**အသစ်**) — `FfmpegSplitterRenderer`။ Stream copy (`-ss` အရင်, `-t`) + `-map 0:v:0 -map 0:a?` (audio မရှိသော part ကို ငြင်းရန်) + FFprobe validation + keyframe-snapped cut ကို `last_report` တွင် တိကျတကျ် report။ Output အမည်က `.partial` ကဲ့သို့ media extension မရှိနိုင်သဖြင့် `-f mp4` ကို တိတိကျကျ ထုတ်သည်။
+- `mmnext/infrastructure/exact_dubbing_render.py` — helper တွေကို `FfmpegTools` သို့ delegate လုပ်ပြီး (copy နှစ်ခု မရှိတော့ပါ)။
+- `mmnext/services/adapters/splitter.py` — planner + demo renderer ကျန်သည်; `LegacySplitterRenderer` ကို infrastructure မှ re-export လုပ်သည် (ffmpeg က UI/config မဟုတ် သော infrastructure layer နှင့် တွဲသည်)။
+- `mmnext/application/splitter_render_coordinator.py` — မအောင်မြင်ပါက **အကြောင်းရင်း** (`self.renderer.error` / `last_report["error"]`) ကို ထုတ်ပြပြီး၊ keyframe snap ကို warning အဖြစ် တင်သည်။
+- `tests/test_splitter_render.py` (**အသစ်**, 25 tests)၊ `tests/test_splitter_worker.py` (**အသစ်**, 6 tests)။
+
+### CRITICAL — worker-thread tool probe (၂၆ စက္ကန့် → ၆ စက္ကန့်)
+
+- [x] **`shutil.which()` က worker thread မှာ ပထမဆုံး ခေါ်ဆိုပါက ~၆ စက္ကန့် ကြာပါတယ်။** `faulthandler` stack dump က `shutil.py:1472 _access_check → ffmpeg_tools.py:48 available → splitter_render.py:69 render_part` ကို တိကျစွာ ပြခဲ့သည်။ တိုင်းတာချက်: main thread `0.008s`၊ worker thread (ပထမ) **`6.353s`**၊ worker thread (ဒုတိယ) `0.008s`၊ `subprocess` က `0.034s` — ဒါကြောင့် တိုင်ကြောင်းသည် subprocess spawn မဟုတ် ဘဲ PATH probe ပေါ်သည်။ `FfmpegSplitterRenderer.render_part` က part တစ်ခုချင်း `available()` ကို ခေါ်သဖြင့် ၃ ပိုင်း render တွင် ၂၆ စက္ကန့် ကုန်ခဲ့သည်။
+- [x] **ဖြေရှင်းချက်:** `shutil.which` answers ကို `(PATH, tool)` key နှင့် memoize လုပ်ခဲ့သည် (process တစ်ခုတည်းအတွက် မပြောင်းနိုင်သဖြင့် ပြန်မေးရန် မလို)။ **Part တစ်ခုချင်း 11.53s → 2.72s**၊ render ၂ ပိုင်း **28s → 6.65s**။ ဤ fix က `exact_dubbing_render.py` ကိုလည်း ကျွန်ုပ် refactor လုပ်ခဲ့သဖြင့် exact-dubbing renderer ကိုလည်း ချက်ချင်းအကျိုးရှိသည်။
+
+### Planner ချိန်ညှိချက် (bug တစ်ခု)
+
+- [x] **`max_extra_wait` က `part_seconds` ထက် ကြီးရင် tail ကိ အားလုံး ဖြေလုပ်ခဲ့သည်။** `plan(6.0, 2.0)` က part ၃ ခု (၂s စီ) အစား **part တစ်ခုတည်း (၆s)** ထုတ်ခဲ့သည် — default wait 5s က ၂s part များ၏ ကျန်ရှိသည်ကို စားလိုက်သည်။ Tail ကို စားရန် part တစ်ခုထက် သို့ မကျော်စေရန် `tail < part_seconds` အခြေအနေ ထည့်ခဲ့ပြီး၊ `test_a_wait_larger_than_the_part_does_not_swallow_everything` က ချိန်ညှိခဲ့သည်။ (65s / 60s မှာ 5s tail ကို စားဒါဖြစ်ပါတယ်)။
+
+### တိကျတကျ တင်ဆက်ချက်
+
+- [x] **Stream-copy cut က keyframe ပေါ်တွင် ကျရောက်ပြီး သို့ သူ၏ အရှေ့တွင် ရှိသည်။** Part တစ်ခုက အမြင့်ဆုံးသော window မှ 2.333s ဖြစ်နိုင်သည် (2.0s window တွင်တောင့်ချိန်) — ဒါကို ဖျော့ချခြင်းမဟုတ်ဘဲ **တင်ပြသည်**: `last_report["start_time"]` နှင့် coordinator ရဲ့ `"Part N: cut snapped from X to Y"` warning။ Part ကို ငြင်းရန် မှားနေသော duration သာ (`PART_DRIFT_TOLERANCE = 0.5s`, packet-sized slack)။
+- [x] **Sparse-keyframe source (test fixture `-g 250`) ကို စစ်ဆေးသည်** — `test_a_snapped_cut_is_reported_not_hidden` နှင့် `test_the_coordinator_warns_when_a_cut_snapped` က worst-case ကို လုပ်ဆောင်သည်။
+- [x] **စစ်ဆေးမှု:** video + audio stream နှစ်ခုလုံး ရှိရမည်၊ duration > 0 နှင့် window နှင့် ကိုက်ညီရမည်။ မရှိသော/မမှန်သော part ကို ငြင်းပြီး ဖိုင်ကို မချန်ထားပါ။
+
+### အခြားသော
+
+- [x] **Test suite က worker thread ကို GIL မ ဆာဆင်ရန်** — တင်းမာသော event-loop spin က GUI thread ကို ကြာချိန်ယနູ တီတန်းလုပ်သဖြင့် worker က ffmpeg child များကို စောင့်နေရသည်။ ယခု `_wait_for` က 200ms poll သုံးသည်။
+- [x] **`render(self)` က `part_{n}.mp4` သော့ချက်** — coordinator နှင့် တူညီသော အမည်နှင့် ကိုက်ညီသည်၊ cell ပြန်လည်အသုံးပြုမှုသည် မှားယွင်းမဖြစ်စေရ။
+
+### ဆက်လက်မလုပ်ရသေးသော အချက်များ
+
+- **Splitter renderer က stream copy သာ လုပ်နေသည်။** Frame-တိကျတကျ လိုအပ်ပါက re-encode လုပ်ရမည် (UI setting မရှိသေးပါ)။ Keyframe drift ကို တိကျတကျ report လုပ်နေသည်မှာ လက်ခံနိုင်သော လမ်းကြောင်းဖြစ်သည်။
+- **Pause detection (`CutReason.PAUSE`/`BREATH`/`QUIETEST`) က UI မှ `pause_times` ကို လက်ခံရုံသာ** — အသံကို တကယ်လေ့လာ၍ ရှာတဲ့ code မရှိပါ (contract တွင် သတ်မှတ်ထားသည်)။
+- **Splitter render ကို UI/real media ဖြင့် UI button (click-through) မှ မစစ်ရသေးပါ** — worker-thread test တစ်ခုက REAL FFmpeg render ကို `start_splitter_render()` မှ တိုက်ရိုက် အလုပ်လုပ်ကြောင်း အတည်ပြထားသည်။
+
+### နောက်ဆုံး စစ်ဆေးချက်
+
+- `.\.venv\Scripts\python.exe -m pytest tests/test_splitter_render.py tests/test_splitter_worker.py tests/test_architecture_gates.py -q --confcutdir=tests` → **43 passed**။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **458 passed, 2 skipped** (skip: opt-in REAL Edge TTS၊ Whisper real media)။
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
+
 ## W. Phase 2 — REAL Edge TTS speech path (2026-10-22)
 
 Exact-dubbing slice ရဲ့ Phase 2။ § V မှာ user ဆုံးဖြတ်ခဲ့သအတိုင်း soundtrack နဲ့ trailing-gap သည် legacy parity ဖြစ်လို့ **behaviour မပြောင်းခဲ့ပါ**။ အဓိက အလုပ်က **REAL speech path ကို ပထမဆုံး အမှန်တကယ် စမ်းပြီး** — ယခင်က `edge_tts` မရှိလို့ အသံပိုင်းက DEMO ပဲ ဖြစ်နေခဲ့ပါတယ်။
