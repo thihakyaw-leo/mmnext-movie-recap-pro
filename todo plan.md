@@ -40,6 +40,17 @@ The project is **not complete**. The PySide6 shell, separate mode/domain contrac
 > stall**: `shutil.which()` took ~6s on its first call from a worker thread and
 > was probed once per part. The current full suite is
 > **458 passed, 2 skipped** (the two skips are opt-in network tests).
+>
+> **Superseded again by the Phase 4 narrator slice (2026-10-23).**
+> `checklist.md` § Y records the remaining narrator gaps closed: segment-level
+> reuse detection (a cached narration is never synthesised again, and the
+> coordinator owns the lookup so it does not depend on the adapter's own
+> cache directory), a per-unit stop check in the translation stage,
+> memoised `edge_tts` availability, and a validated publish for REAL renders
+> (a truncated or stream-less output is refused, and its partial is removed).
+> Two self-inflicted regressions were caught by the new tests and fixed
+> (a dropped `os.replace`, and reuse depending on the adapter's cache dir).
+> The current full suite is **464 passed, 2 skipped**.
 
 Fresh verification for this documentation update: `pytest tests -q --confcutdir=tests -p no:cacheprovider` with the approved local media/model fixture and project-local FFmpeg tools enabled: **291 passed in 63.32s**. Focused saved-transcript tests: `pytest tests/test_transcript_open.py -q --confcutdir=tests -p no:cacheprovider` → **6 passed in 0.27s**. This does not establish full product or clean-machine readiness.
 

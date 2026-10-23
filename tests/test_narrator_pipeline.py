@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from mmnext.application.narrator_coordinator import NarratorPlanCoordinator
@@ -232,3 +234,185 @@ def test_legacy_tts_cache_key_is_stable() -> None:
         "မြန်မာ", "my-MM-ThihaNeural", 1.0
     )
     assert adapter.voice_discovery()
+
+
+# --------------------------------------------------------------------------- #
+# Reuse, stop granularity, output validation
+# --------------------------------------------------------------------------- #
+
+
+def test_a_second_run_reuses_cached_speech(tmp_path) -> None:
+    """An unchanged narration must not be synthesised twice."""
+    calls: list[str] = []
+
+    class _Counting(DemoSpeechSynthesizer):
+        def synthesize_segment(self, text, voice="my-MM-ThihaNeural", rate=1.0, out_path=""):
+            calls.append(text)
+            return super().synthesize_segment(text, voice, rate, out_path)
+
+    coordinator = NarratorPipelineCoordinator(
+        translator=DemoTranslationProvider(),
+        tts=_Counting(cache_dir=str(tmp_path / "tts")),
+        is_demo=True,
+    )
+    cache_dir = str(tmp_path / "tts")
+    settings = {"tts_cache_dir": cache_dir, "ratio": "Original"}
+
+    first = coordinator.run(_transcript(), "video.mp4", 2.0, _output(tmp_path), settings)
+    assert first.ok is True
+    assert calls, "the first run must synthesise"
+    assert first.reused_segments == 0
+
+    second = coordinator.run(_transcript(), "video.mp4", 2.0, str(tmp_path / "b.mp4"), settings)
+    assert second.ok is True
+    assert len(calls) == 2, "a cached narration must not be synthesised again"
+    assert second.reused_segments == 2
+    assert any("reused" in warning.lower() for warning in second.warnings)
+
+
+def test_a_changed_narration_invalidates_the_cache(tmp_path) -> None:
+    """Editing one narration must re-synthesise only that segment."""
+    calls: list[str] = []
+
+    class _Counting(DemoSpeechSynthesizer):
+        def synthesize_segment(self, text, voice="my-MM-ThihaNeural", rate=1.0, out_path=""):
+            calls.append(text)
+            return super().synthesize_segment(text, voice, rate, out_path)
+
+    class _Echo(DemoTranslationProvider):
+        """Narrations that track the source text, so an edit is visible."""
+
+        def translate_segments(self, segments, **kwargs):
+            return [segment.source_text for segment in segments]
+
+    coordinator = NarratorPipelineCoordinator(
+        translator=_Echo(),
+        tts=_Counting(cache_dir=str(tmp_path / "tts")),
+        is_demo=True,
+    )
+    settings = {"tts_cache_dir": str(tmp_path / "tts")}
+    coordinator.run(_transcript(), "video.mp4", 2.0, _output(tmp_path), settings)
+    assert len(calls) == 2
+
+    edited = [
+        TranscriptRow(row_id="1", text="Hello", start=0.0, duration=1.0),
+        TranscriptRow(row_id="2", text="changed", start=1.0, duration=1.0),
+    ]
+    calls.clear()
+    second = coordinator.run(edited, "video.mp4", 2.0, str(tmp_path / "c.mp4"), settings)
+    assert second.ok is True
+    # The unchanged unit is reused; only the edited one is synthesised again.
+    assert len(calls) == 1, "only the changed narration may be re-synthesised"
+    assert second.reused_segments == 1
+
+
+def test_the_cached_audio_needs_no_network_on_the_second_run(tmp_path) -> None:
+    """The cache is consulted before the synthesiser is called at all."""
+    class _Exploding(DemoSpeechSynthesizer):
+        def synthesize_segment(self, *args, **kwargs):
+            raise AssertionError("synthesiser must not be called for a cached narration")
+
+    first = NarratorPipelineCoordinator(
+        translator=DemoTranslationProvider(),
+        tts=DemoSpeechSynthesizer(),
+        is_demo=True,
+    ).run(_transcript(), "video.mp4", 2.0, _output(tmp_path),
+          {"tts_cache_dir": str(tmp_path / "tts")})
+    assert first.ok is True
+
+    second = NarratorPipelineCoordinator(
+        translator=DemoTranslationProvider(),
+        tts=_Exploding(cache_dir=str(tmp_path / "tts")),
+        is_demo=True,
+    ).run(_transcript(), "video.mp4", 2.0, str(tmp_path / "d.mp4"),
+          {"tts_cache_dir": str(tmp_path / "tts")})
+    assert second.ok is True, second.message
+    assert second.reused_segments == 2
+
+
+def test_a_stop_during_translation_is_honoured_per_unit(tmp_path) -> None:
+    """A stop arriving mid-batch stops after that unit, not after the batch."""
+    class _Stopping(DemoTranslationProvider):
+        def __init__(self, coordinator):
+            super().__init__()
+            self._coordinator = coordinator
+            self._calls = 0
+
+        def translate_segments(self, segments, **kwargs):
+            self._calls += 1
+            if self._calls == 1:
+                # Ask for a stop while the batch is being translated.
+                self._coordinator.request_stop()
+            return super().translate_segments(segments, **kwargs)
+
+    coordinator = NarratorPipelineCoordinator(is_demo=True)
+    coordinator.translator = _Stopping(coordinator)
+    result = coordinator.run(
+        _transcript(), "video.mp4", 2.0, _output(tmp_path),
+        {"translation_batch_size": 8, "tts_cache_dir": str(tmp_path / "tts")},
+    )
+    assert result.ok is False
+    assert result.stopped is True
+    # The stop is checked per unit, so the second unit never gets translated.
+    assert result.segments[0].narration
+    assert not result.segments[1].narration
+
+
+def test_a_real_render_is_validated_before_it_is_published(tmp_path) -> None:
+    """A REAL render cannot ship a file with no audio/video streams."""
+    video = _make_video(tmp_path / "source.mp4", seconds=3.0)
+
+    class _Writing(DemoSmartSyncRenderer):
+        """Reports success but writes a file that is not media at all."""
+
+        def render(self, video_path, segments, output_path, settings):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"not media")
+            return True
+
+    coordinator = NarratorPipelineCoordinator(
+        renderer=_Writing(), is_demo=False
+    )
+    result = coordinator.run(
+        _transcript(), str(video), 3.0, _output(tmp_path),
+        {"tts_cache_dir": str(tmp_path / "tts")},
+    )
+    assert result.ok is False, result.message
+    assert "validation" in result.message.lower(), result.message
+    assert result.output_path == "", "a refused render must not publish a path"
+    assert not Path(_output(tmp_path)).exists(), "no final file may be left behind"
+    # The partial it did write is not mistaken for a finished render either.
+    assert not Path(_output(tmp_path)).with_suffix(".mp4.partial").exists()
+
+
+def test_a_demo_render_is_not_validated(tmp_path) -> None:
+    """A DEMO run writes its placeholder and keeps its honest label."""
+    coordinator = NarratorPipelineCoordinator(
+        renderer=DemoSmartSyncRenderer(), is_demo=True
+    )
+    result = coordinator.run(
+        _transcript(), "video.mp4", 2.0, _output(tmp_path),
+        {"tts_cache_dir": str(tmp_path / "tts")},
+    )
+    assert result.ok is True, result.message
+    assert result.is_demo is True
+    assert Path(result.output_path).is_file()
+
+
+def _make_video(path, seconds: float = 3.0):
+    import shutil
+    import subprocess
+
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        pytest.skip("FFmpeg/FFprobe are required for the validation test")
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=320x180:r=15",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", f"{seconds}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-g", "15", "-c:a", "aac", str(path),
+        ],
+        check=True,
+    )
+    return path

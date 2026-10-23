@@ -1127,7 +1127,44 @@ Independent review က exact-dubbing slice ကို စစ်ဆေးပြီ
 - `.\.venv\Scripts\python.exe -m pytest tests/test_exact_dubbing_render.py tests/test_exact_dubbing_panel.py tests/test_exact_dubbing_validation_gate.py tests/test_transcript_regressions.py tests/test_architecture_gates.py -q --confcutdir=tests -p no:cacheprovider` → **91 passed, 1 skipped in 34.31s**။
 - `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **421 passed, 1 skipped in 121.47s**။
 - `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
-- `MMNEXT_TRANSCRIPT_SMOKE_MEDIA=inputs/harvard-full.mp4`, `MMNEXT_TRANSCRIPT_SMOKE_MODEL=models/tiny.en` ဖြင့် opt-in real smoke → **1 passed**။
+
+
+## Y. Phase 4 — narrator heavy integration: reuse, stop granularity, output validation (2026-10-23)
+
+Phase 4 တွင် coordinator / adapters / worker / UI wiring အားလုံး ရှိပြီးဖြစ်သဖြင့် ဤ slice က code-review တွင် မှတ်တမ်းတင်ခဲ့သော **ကျန်ရှိခဲ့သော gap ၃ ခု** ကိုသော ဦးစားပေးလုပ်ဆောင်ခဲ့သည် — reuse detection၊ segment-boundary stop နှင့် final output validation။
+
+### ပြောင်းလဲမှုများ
+
+- `mmnext/services/adapters/narrator_tts.py` (**ပြန်ရေးခဲ့**) —
+  - **Defect တစ်ခု ဖြေရှင်းခဲ့သည်**: `DemoTranslationProvider.available()` က `narrator_translation.py` တွင် **နှစ်ခါ သတ်မှတ်ထား**ခဲ့ပြီး ပထမ တစ်ခုတွင် `return True` နောက် `self._stage = "idle"` ကို မရောက်နိုင်ဘဲ ရှိနေခဲ့ပါတယ်။ အခု တစ်ချက်တည်း ရှင်းလင်းပါတယ်။
+  - **`edge_tts` availability ကို memoize လုပ်ခဲ့သည်** — `aiohttp` ကို ဆွဲတကြီးလို့ ပထမ import က ~၂ စက္ကန့် ကြာပြီး process တစ်ခုလုံးမှာ မပြောင်းနိုင်သဖြင့်၊ status read တစ်ခုချင်းက ၎င်းကို ပြန်မတွက်ရပါ။ (exact-dubbing adapter တွေမှာ လုပ်ခဲ့တော့သည့် အတိုင်း)
+  - **Cache extension ကို neutral `.audio` ပြောင်းခဲ့သည်** — Edge TTS က MP3 bytes ရေးပြီး offline က text ရေးတာမို့ `.txt` က ဖိုင်အမည်ကို တိတိကျကျ မပြောပါ။
+  - **Atomic write** — synthesis output နှင့် cache နှစ်ခုလုံး `.partial` → rename ဖြစ်ပါတယ်။
+- `mmnext/application/narrator_pipeline_coordinator.py` —
+  - **Reuse detection** — synthesis မစခင် cache key ကို ဦးစွာ မေးပါတယ်။ Hit ရှိရင် synthesis ကို **လုံးဝ မခေါ်ပါ** (network မထိပါ)၊ `reused_segments` count နှင့် `warnings` တွင် note တင်ပါတယ်။ Cache root ကို coordinator က လည်း သိမှဆက်လုပ်တာမို့ adapter တစ်ခုက cache_dir မရှိလည်း reuse ရပ်မသွားပါ။
+  - **Per-unit stop** — translation loop က segment တစ်ခုချင်း stop ကို စစ်ပါတယ် (အရင်က batch တစ်ခုချင်းသာ စစ်တာမို့ segment ၈ ခုပါ batch တစ်ခုကို စောင့်ရပါတယ်)။
+  - **`warnings` နှင့် `reused_segments`** ကို `NarratorPipelineResult` တွင် ထည့်ခဲ့ပါတယ်။
+  - **Final output validation** — REAL render တစ်ခုကို `FfmpegTools.validate_media` နဲ့ `.partial` → rename မလုပ်ခင် စစ်ပါတယ်။ Validation ပျက်ကွဲပါက duration / stream မရှိတာ တွေ့ပြီး partial ကို ဖျက်ပါတယ်။ DEMO renderer က placeholder ရေးတာမို့ DEMO run ကို validation မလုပ်ပါ (DEMO ဟု ရှင်းလင်းတင်ပြထားသည်)။
+- `tests/test_narrator_pipeline.py` — test **၆ ခု** အသစ်း (reuse, cache invalidation, no-network-on-reuse, per-unit stop, validation-before-publish, demo-not-validated)။
+
+### Test တွေ ဖမ်းမိခဲ့သော ကျွန်တော့်ကိုယ်ပိုင် bug ၂ ခု
+
+- [x] **Coordinator ကို ပြန်ရေးရင်း `os.replace` ပျောက်ခဲ့သည်** — REAL validation အောင်မြင်ပါက နှင့် DEMO path နှစ်ခုလုံးတွင် partial → final rename ကို ပြန်ထည့်ခဲ့ခါနီး test တွေက တွေ့ပြီး ပြန်ထည့်ခဲ့ပါတယ်။
+- [x] **Reuse က adapter cache_dir ပေါ်မူတည်နေခဲ့သည်** — cache lookup ကို coordinator ထဲ ရွှေ့ပြီး ၎င်း၏ `tts_cache_dir` ကိုလည်း သုံးစေခဲ့ပါတယ်။
+- [x] **Validation ပျက်ကွဲပါက partial ကို မဖျက်ခဲ့ခါနီး** — ယခု ဖျက်ပါပြီး၊ နောက်ပိုင်း run တစ်ခုက ပြီးစီးဟု မမှတ်ယူပါ။
+
+### ဆက်လက်မလုပ်ရသေးသော အချက်များ
+
+- **Gemini story context / glossary ကို REAL translator မှာ အသုံးပြုနိုင်သေး�်သည်** — protocol က `context`/`glossary` ကို လက်ခံပြီး coordinator ကလည်�် ပေးပို့ပါတယ်၊ ဒါပေမယ့် `LegacyNarratorTranslationAdapter` က legacy module ကို defensive load လုပ်ရသဖြင့် credential မရှိပါက DEMO ဖြစ်နေပါတယ်။
+- **Smart Sync renderer က legacy project ကို subprocess နဲ့ မလုပ်ဆောင်ရသေးပါ** — module-level import ဖြစ်ပြီး၊ legacy entry point မရှိပါက `available() is False` ဖြစ်ပါတယ်။
+- **Batch-folder queue၊ narration editor save/re-render၊ translation audit၊ output reveal** က မလုပ်ရသေးပါ။
+
+### နောက်ဆုံး စစ်ဆေးချက်
+
+- `.\.venv\Scripts\python.exe -m pytest tests/test_narrator_pipeline.py tests/test_narrator_coordinator.py tests/test_narrator_planning_service.py tests/test_narrator_pipeline_ui.py -q --confcutdir=tests` → **30 passed**။
+- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **464 passed, 2 skipped** (skips: REAL Edge TTS opt-in၊ Whisper real media opt-in)။
+- `QT_QPA_PLATFORM=offscreen .\.venv\Scripts\python.exe scripts\check_shell.py` → `MainWindow OK`, 7 မျက်နှာ, `closed`, **exit 0**။
+
 
 
 ## V. Phase 1 cleanup — exact-dubbing slice (2026-10-22)
