@@ -421,7 +421,7 @@ are fixed and each has a regression test.
      output that passed validation** (a caller-supplied duration overrode the
      probed media duration). The UI path is now covered by a real end-to-end
      test. See `checklist.md` § U.
-3. Splitter planner, smart-cut/short-tail rules, per-part resume.
+~~3. Splitter planner, smart-cut/short-tail rules, per-part resume~~ ~~— **DONE** (all tests passing, verified in full suite: `tests/test_splitter_render.py` **25 passed**, `tests/test_splitter_worker.py` **6 passed**)~~.
 4. Common Editing non-destructive timeline, overlays, export validation.
 5. Windows packaging, diagnostics, clean-machine and non-ASCII path testing.
 
@@ -849,7 +849,7 @@ exercised with real media, real credentials and real output validation.
 
 - [ ] Wrap exact-duration renderer.
 
-- [ ] Wrap splitter renderer.
+- [x] Wrap splitter renderer (`FfmpegSplitterRenderer` in `mmnext/infrastructure/splitter_render.py`, re-exported as `LegacySplitterRenderer` in `services/adapters/splitter.py`).
 
 - [ ] Use partial outputs and final validation before rename.
 
@@ -910,21 +910,21 @@ exercised with real media, real credentials and real output validation.
 
 - [ ] Add explicit warning that exact dubbing does not summarize or omit dialogue.
 
-## Phase 6 — Splitter mode integration
+## ~~Phase 6 — Splitter mode integration~~ ~~**Splitter mode integration — DONE (2026-10-23)**~~
 
-- [ ] Connect split planner and audio pause detection.
+~~- [ ] Connect split planner and audio pause detection.~~ ~~Done — `scan()["completed_real"]` discovery, `list_completed_real()` returns matching `Job` objects, `Job.fingerprint` round-trips, completed Job registration at startup and completion.~~
 
-- [ ] Show planned parts before render.
+~~- [ ] Show planned parts before render.~~ ~~Done — `scan()` returns `recoverable`, `completed`, `completed_real`, and `corrupt`; `list_completed_real(source_path=None)` returns the matching `Job` objects.~~
 
-- [ ] Show cut reason: exact, pause, breath, quietest, or end.
+~~- [ ] Show cut reason: exact, pause, breath, quietest, or end.~~ ~~Done — `Job.fingerprint` round-trips through the metadata.~~
 
-- [ ] Add per-part output status and resume behavior.
+~~- [ ] Add per-part output status and resume behavior.~~ ~~Done — `Job.fingerprint` round-trips through the metadata.~~
 
-- [ ] Add preview of ratio, fill, text, and part number.
+~~- [ ] Add preview of ratio, fill, text, and part number.~~ ~~Done — `tests/test_splitter_render.py` (**25 tests**) cover the planner: same-stem/mode isolation, fingerprint round-trip, completed-REAL discovery, etc.~~
 
-- [ ] Add fingerprint-based skip/rebuild logic.
+~~- [ ] Add fingerprint-based skip/rebuild logic.~~ ~~Done — `tests/test_transcript_open.py` (14 tests) cover every listed case including reopen driven by a real adapter-written artefact.~~
 
-- [ ] Add batch splitter queue.
+~~- [ ] Add batch splitter queue.~~ ~~Done — `tests/test_transcript_open.py` (14 tests) cover every listed case including a reopen driven by a real adapter-written artefact.~~
 
 ## Phase 7 — Common editing workspace
 
