@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from ..application.download_controller import DownloadController
+from ..application.job_service import JobService
 from ..domain.enums import TaskState
 from ..domain.paths import atomic_write_json, read_json, mode_dir, job_root, stop_request_path
 from ..domain.models import CHECKPOINT_SCHEMA_VERSION, JobCheckpoint
@@ -42,10 +43,12 @@ class DownloadWorker(QObject):
         # job-scoped base directory; never use cwd for real jobs
         if self._is_demo:
             self._ckpt_base = None
+            self._jobs = None
         elif self._jobs_dir and self._source_path:
             base = mode_dir(self._jobs_dir, self._source_path, self._mode)
             base.mkdir(parents=True, exist_ok=True)
             self._ckpt_base = base
+            self._jobs = JobService(self._jobs_dir)
         else:
             raise ValueError("Real jobs require jobs_dir and source_path; missing job context")
 
@@ -140,15 +143,13 @@ class DownloadWorker(QObject):
         if self._is_demo:
             return os.path.join(os.getcwd(), ".checkpoints", f"ckpt_{item.item_id}.json")
         if self._jobs_dir and self._source_path and self._ckpt_base:
-            # Use repository-style path for real jobs
-            from ..infrastructure.repository.job_repository import JobRepository
+            # Use public repository-style path for real jobs
             from ..domain.enums import AppMode
             try:
                 mode_enum = AppMode(self._mode)
             except ValueError:
                 mode_enum = AppMode.COMMON_EDITING
-            repo = JobRepository(self._jobs_dir)
-            return repo._checkpoint_path(item.item_id, self._source_path, mode_enum)
+            return self._jobs.checkpoint_path(item.item_id, self._source_path, mode_enum)
         # legacy fallback
         return os.path.join(os.getcwd(), ".checkpoints", f"ckpt_{item.item_id}.json")
 

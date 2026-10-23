@@ -11,6 +11,7 @@ from typing import Callable, Optional, Tuple
 from ..domain.models import TranscriptRow, JobCheckpoint
 from ..domain.events import ProgressEvent, LogEvent
 from ..domain.enums import Stage, TaskState, AppMode
+from ..domain.errors import TranscriptStopped
 from ..domain.fingerprint import FINGERPRINT_SCHEMA_VERSION, canonical_fingerprint
 from ..domain.paths import atomic_write_json
 from .repository.job_repository import JobRepository
@@ -21,10 +22,6 @@ except ImportError:
     WhisperModel = None
 
 __all__ = ["DemoTranscriptProvider", "WhisperTranscriptAdapter", "TranscriptStopped"]
-
-
-class TranscriptStopped(RuntimeError):
-    """Cooperative stop, raised only after the checkpoint is durable."""
 
 
 class DemoTranscriptProvider:
@@ -62,7 +59,7 @@ class WhisperTranscriptAdapter:
         self._fingerprint_settings_value: dict = {}
         # Keep the v1 file name, but scope its parent to source and mode to
         # prevent two same-stem videos or modes overwriting one another.
-        self.work_dir = self.repo._job_dir(self.job_id, source_path) / mode.value
+        self.work_dir = self.repo.job_dir(self.job_id, source_path) / mode.value
         self.artifact_path = self.work_dir / "transcripts" / f"{Path(source_path).stem}.transcript.json"
 
     def request_stop(self):
