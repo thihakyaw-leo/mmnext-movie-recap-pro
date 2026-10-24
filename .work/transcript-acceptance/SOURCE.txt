@@ -1,0 +1,12 @@
+﻿Real-media transcript acceptance fixture
+Actual source: Real Python, Speech Recognition with Python examples.
+Repository: https://github.com/realpython/python-speech-recognition
+Audio: https://raw.githubusercontent.com/realpython/python-speech-recognition/master/audio_files/harvard.wav
+License: MIT; original copyright and permission notice retained in inputs/REALPYTHON-LICENSE.txt.
+Context: https://realpython.com/python-speech-recognition/
+Derivative: first 12 seconds muxed with a generated black 320x180 video, audio AAC mono 16 kHz; not personal user media.
+The initially selected Open Speech Repository file was NOT used because its host returned HTTP 406.
+Model: https://huggingface.co/Systran/faster-whisper-tiny.en (MIT), downloaded into models/tiny.en and run locally on CPU/int8.
+FFmpeg and FFprobe: static-ffmpeg 3.0 downloaded win32 binaries into this task folder. The acceptance runner explicitly prepends this local win32 directory to its process PATH; no persistent PATH changes.
+All runtime/tool/model/test-output changes are under J:\mmnext-movie-recap-pro; neither legacy project is used.
+Run from project root: .\.venv\Scripts\python.exe .work\transcript-acceptance\acceptance.py

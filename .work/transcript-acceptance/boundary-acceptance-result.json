@@ -1,0 +1,119 @@
+{
+  "status": "PASS",
+  "source_sha256": "971b4163670445c415c6b0fb6813c38093409ecac2f6b4d429ae3574d24ad470",
+  "model": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en",
+  "device": "cpu/int8",
+  "timing_tolerance_s": 0,
+  "source_url": "https://raw.githubusercontent.com/realpython/python-speech-recognition/master/audio_files/harvard.wav",
+  "clipped_rejection": {
+    "status": "PASS",
+    "error": "Whisper segment s3 [10.0, 13.0] exceeds authoritative video duration 12.0s for J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\inputs\\osr-harvard-12s.mp4; source timing unchanged. Inspect input/model output and restart transcription",
+    "checkpoint": {
+      "completed_units": 3,
+      "fingerprint": "fp2:c6461aeb4cc2222a61c4754c0ee414228e51610e",
+      "fingerprint_schema_version": 1,
+      "fingerprint_settings": {
+        "auto_detect": true,
+        "language": null,
+        "model": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en",
+        "schema": 1
+      },
+      "fingerprint_source_type": "local_file",
+      "message": "Transcription failed: Whisper segment s3 [10.0, 13.0] exceeds authoritative video duration 12.0s for J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\inputs\\osr-harvard-12s.mp4; source timing unchanged. Inspect input/model output and restart transcription. Fix dependency/input and restart; resume unsupported.",
+      "mode": "narrator",
+      "output_path": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\boundary-rejection-jobs\\osr-harvard-12s_7329af1d\\jobs\\osr-harvard-12s\\narrator\\audio_tmp\\osr-harvard-12s.wav",
+      "partial_path": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\boundary-rejection-jobs\\osr-harvard-12s_7329af1d\\jobs\\osr-harvard-12s\\narrator\\transcripts\\osr-harvard-12s.transcript.segments.json",
+      "resume_supported": false,
+      "schema_version": 2,
+      "state": "failed",
+      "task_id": "transcribe_osr-harvard-12s",
+      "total_units": 0,
+      "updated_at": "2026-10-22T03:23:45.831519Z"
+    },
+    "max_progress": 83.33333333333334
+  },
+  "full_source": {
+    "status": "PASS",
+    "fixture": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\inputs\\harvard-full.mp4",
+    "original_audio_duration_s": 18.356190476190477,
+    "duration_s": 18.357,
+    "elapsed_s": 2.051,
+    "language": "en",
+    "rows": [
+      {
+        "row_id": "s0",
+        "start": 0.0,
+        "duration": 4.5,
+        "text": "The stale smell of old beer lingers."
+      },
+      {
+        "row_id": "s1",
+        "start": 4.5,
+        "duration": 2.54,
+        "text": "It takes heat to bring out the odor."
+      },
+      {
+        "row_id": "s2",
+        "start": 7.04,
+        "duration": 2.96,
+        "text": "A cold dip restores health and zest."
+      },
+      {
+        "row_id": "s3",
+        "start": 10.0,
+        "duration": 2.6799999999999997,
+        "text": "A salt pickle tastes fine with ham."
+      },
+      {
+        "row_id": "s4",
+        "start": 12.68,
+        "duration": 2.4000000000000004,
+        "text": "Tacos al pastor are my favorite."
+      },
+      {
+        "row_id": "s5",
+        "start": 15.08,
+        "duration": 2.5200000000000014,
+        "text": "A zestful food is the hot cross bun."
+      }
+    ],
+    "audio": {
+      "channels": 1,
+      "rate": 16000,
+      "sample_width": 2,
+      "duration_s": 18.357
+    },
+    "artifact": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\boundary-full-jobs\\harvard-full_dc8bb743\\jobs\\harvard-full\\narrator\\transcripts\\harvard-full.transcript.json",
+    "checkpoint": {
+      "completed_units": 6,
+      "fingerprint": "fp2:1df1e27e7d609cd46e121025e2d25b7ae3212e90",
+      "fingerprint_schema_version": 1,
+      "fingerprint_settings": {
+        "auto_detect": true,
+        "language": null,
+        "model": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en",
+        "schema": 1
+      },
+      "fingerprint_source_type": "local_file",
+      "message": "Transcript artifact committed",
+      "mode": "narrator",
+      "output_path": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\boundary-full-jobs\\harvard-full_dc8bb743\\jobs\\harvard-full\\narrator\\transcripts\\harvard-full.transcript.json",
+      "partial_path": "",
+      "resume_supported": false,
+      "schema_version": 2,
+      "state": "complete",
+      "task_id": "transcribe_harvard-full",
+      "total_units": 6,
+      "updated_at": "2026-10-22T03:23:48.335846Z"
+    }
+  },
+  "real_ui": {
+    "status": "PASS",
+    "row_count": 6,
+    "badge": "REAL",
+    "progress": 100,
+    "artifact": "C:\\Users\\thiha\\AppData\\Local\\Temp\\opencode\\mmnext-profile\\.mmnext\\jobs\\harvard-full_dc8bb743\\jobs\\harvard-full\\narrator\\transcripts\\harvard-full.transcript.json",
+    "exact_untranslated_blocked": true,
+    "mode": "offscreen; real worker and inference; cached model injected via constructor"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "created_at": "2026-10-23T10:53:49.176579Z",
+  "duration_s": 18.357,
+  "fingerprint": "fp2:967f7cbabadc79a11aa5a519dffa4e0bd4657dff",
+  "fingerprint_schema_version": 1,
+  "fingerprint_settings": {
+    "auto_detect": false,
+    "language": null,
+    "model": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en",
+    "schema": 1
+  },
+  "fingerprint_source_type": "local_file",
+  "is_demo": false,
+  "language": "en",
+  "mode": "narrator",
+  "model": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en",
+  "rows": [
+    {
+      "duration": 4.5,
+      "row_id": "s0",
+      "start": 0.0,
+      "text": "The stale smell of old beer lingers."
+    },
+    {
+      "duration": 2.54,
+      "row_id": "s1",
+      "start": 4.5,
+      "text": "It takes heat to bring out the odor."
+    },
+    {
+      "duration": 2.96,
+      "row_id": "s2",
+      "start": 7.04,
+      "text": "A cold dip restores health and zest."
+    },
+    {
+      "duration": 2.6799999999999997,
+      "row_id": "s3",
+      "start": 10.0,
+      "text": "A salt pickle tastes fine with ham."
+    },
+    {
+      "duration": 2.4000000000000004,
+      "row_id": "s4",
+      "start": 12.68,
+      "text": "Tacos al pastor are my favorite."
+    },
+    {
+      "duration": 2.5200000000000014,
+      "row_id": "s5",
+      "start": 15.08,
+      "text": "A zestful food is the hot cross bun."
+    }
+  ],
+  "schema_version": 1,
+  "source_path": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\inputs\\harvard-full.mp4"
+}

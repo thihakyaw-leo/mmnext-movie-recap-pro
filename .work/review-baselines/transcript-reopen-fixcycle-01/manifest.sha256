@@ -1,0 +1,15 @@
+# SHA-256 manifest - No-Git review baseline
+
+8ee92681d0241516d55b281e5842b85514641076d81b28a7292f5ceaad9ca2eb  mmnext/domain/__init__.py  [baseline, 260 bytes]
+(absent)  mmnext/domain/fingerprint.py  [absent-before-change, 0 bytes]
+76a5c6dff381d1cbb8ced62293eb17a53dfe23538e7ce0ed9b5d432c350ab7ae  mmnext/domain/models.py  [baseline, 18839 bytes]
+4cfb71268012fc37085a53055cd2ee6ac8bddb329136d0692bb14f82fcaa0ba2  mmnext/infrastructure/repository/job_repository.py  [baseline, 15707 bytes]
+0c99f818e5c55f04f299fc15b4fa539e3fef22cbdd6667e2db4457f5a3cf379e  mmnext/infrastructure/transcript_adapter.py  [baseline, 12783 bytes]
+e10c81bb8126c428c607f2dafab1fe371c19b66d8b39b626dab2f21e430e372a  mmnext/ui/app_context.py  [baseline, 21603 bytes]
+(absent)  mmnext/ui/transcript_open_worker.py  [absent-before-change, 0 bytes]
+73e7cd39049c408d7b8a564750fe3a73da0d7f95b10e82ce2159da87c5af477b  mmnext/ui/screens/jobs_screen.py  [baseline, 9500 bytes]
+cf022e0a686b266cbe0e677ca8ce2ece1b60073f5267f011ea27a849a704847a  tests/test_transcript_open.py  [baseline, 7889 bytes]
+0338a4cd4465bd22d9e5a2cb6451a5569fcc5a4d68638c48e81bc5058f2995c3  tests/test_job_repository.py  [baseline, 8441 bytes]
+(absent)  tests/test_fingerprint.py  [absent-before-change, 0 bytes]
+87301b540a49c8dc9e0a679a453521776411bc0c9ba5a3f0a01c2b946049c584  todo plan.md  [baseline, 24657 bytes]
+c37cfdb60f32f9f9d773e480a928c0eb38f76e4d19846b6caae12c34c18903c6  checklist.md  [baseline, 59483 bytes]

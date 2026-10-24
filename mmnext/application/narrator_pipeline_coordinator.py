@@ -178,7 +178,17 @@ class NarratorPipelineCoordinator:
             self.log("Narrator pipeline: translating")
             self._emit(sink, 15.0, Stage.TRANSLATE, "Translating narration units")
             language_code = settings.get("language_code")
+            audit_warnings = []
             for start in range(0, len(segments), batch_size):
+                if self._stop_requested:
+                    return NarratorPipelineResult(
+                        is_demo=self.is_demo,
+                        stopped=True,
+                        segments=segments,
+                        warnings=warnings + audit_warnings,
+                        reused_segments=reused,
+                        message="Stopped during translation",
+                    )
                 batch = segments[start:start + batch_size]
                 batch_id = f"batch_{start // batch_size + 1:04d}"
                 translations = self.translator.translate_segments(
@@ -191,20 +201,19 @@ class NarratorPipelineCoordinator:
                     return NarratorPipelineResult(
                         is_demo=self.is_demo,
                         segments=segments,
-                        warnings=warnings,
+                        warnings=warnings + audit_warnings,
+                        reused_segments=reused,
                         message="Translation returned an unexpected number of units",
                     )
                 for segment, translation in zip(batch, translations):
                     segment.translation = translation
                     segment.narration = translation
-                    # A stop is honoured per unit, not only per batch: a long
-                    # batch must not delay the stop by every unit after it.
                     if self._stop_requested:
                         return NarratorPipelineResult(
                             is_demo=self.is_demo,
                             stopped=True,
                             segments=segments,
-                            warnings=warnings,
+                            warnings=warnings + audit_warnings,
                             reused_segments=reused,
                             message="Stopped during translation",
                         )
@@ -213,7 +222,7 @@ class NarratorPipelineCoordinator:
                         is_demo=self.is_demo,
                         stopped=True,
                         segments=segments,
-                        warnings=warnings,
+                        warnings=warnings + audit_warnings,
                         reused_segments=reused,
                         message="Stopped after translation",
                     )
@@ -227,6 +236,7 @@ class NarratorPipelineCoordinator:
                             "translations": [segment.narration for segment in batch],
                         },
                     )
+            warnings.extend(audit_warnings)
 
         # -- stage 3: synthesise ---------------------------------------------- #
         if self.tts is not None:
@@ -260,8 +270,17 @@ class NarratorPipelineCoordinator:
                     audio_path.write_bytes(cached.read_bytes())
                     reused += 1
                     self._warn(
-                        warnings, f"{segment.segment_id}: reused cached speech"
+                        warnings, f"{segment.segment_id}: reused cached speech (key={key[:8]})"
                     )
+                    if self._stop_requested:
+                        return NarratorPipelineResult(
+                            is_demo=self.is_demo,
+                            stopped=True,
+                            segments=segments,
+                            warnings=warnings,
+                            reused_segments=reused,
+                            message="Stopped during synthesis",
+                        )
                     continue
                 audio_path = cache_dir / f"{segment.segment_id}_{key[:16]}.audio"
                 result_path = self.tts.synthesize_segment(
@@ -287,6 +306,15 @@ class NarratorPipelineCoordinator:
                         keyed.write_bytes(Path(result_path).read_bytes())
                     except OSError:
                         pass
+                if self._stop_requested:
+                    return NarratorPipelineResult(
+                        is_demo=self.is_demo,
+                        stopped=True,
+                        segments=segments,
+                        warnings=warnings,
+                        reused_segments=reused,
+                        message="Stopped during synthesis",
+                    )
             if self._stop_requested:
                 return NarratorPipelineResult(
                     is_demo=self.is_demo,

@@ -153,6 +153,7 @@ class AppContext(QObject):
     # splitter
     splitterProgress = Signal(object)
     splitterStateChanged = Signal(str, str)
+    commonEditingStateChanged = Signal(str, str)
 
     # exact dubbing render
     exactRenderProgress = Signal(object)
@@ -219,6 +220,8 @@ class AppContext(QObject):
         self._splitter_thread = None
         self.splitter_state = "idle"
         self.splitter_message = "No splitter run yet."
+        self.common_editing_state = "idle"
+        self.common_editing_message = "No common editing export yet."
 
         self.project.add_listener(self._on_project_event)
         self.downloads.add_listener(self._on_download_event)
@@ -321,6 +324,24 @@ class AppContext(QObject):
 
     def log_entries(self) -> list[LogEntry]:
         return list(self._log_entries)
+
+    def export_logs(self, path: str) -> None:
+        import json
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            {
+                "timestamp": entry.timestamp,
+                "level": entry.level.value,
+                "source": entry.source,
+                "message": entry.message,
+            }
+            for entry in self._log_entries
+        ]
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     @property
     def _job_repository(self):
@@ -625,6 +646,9 @@ class AppContext(QObject):
         selected = [part for part in parts if getattr(part, "include", True)]
         if not selected:
             raise ValueError("No selected parts to render")
+        duration = float(session.total_duration())
+        if duration <= 0:
+            raise ValueError("No source duration to render against")
         source_path = video_path or (session.source.location if session.source else "")
         target_dir = output_dir or str(Path(session.output_folder or self._jobs_dir) / "splitter")
         Path(target_dir).mkdir(parents=True, exist_ok=True)
@@ -633,7 +657,9 @@ class AppContext(QObject):
         from ..application.splitter_render_coordinator import SplitterRenderCoordinator
 
         renderer = LegacySplitterRenderer() if not session.is_demo else DemoSplitterRenderer()
-        is_demo = session.is_demo or not renderer.available()
+        if not session.is_demo and not renderer.available():
+            raise ValueError("FFmpeg/FFprobe are unavailable; splitter render cannot run in REAL mode")
+        is_demo = session.is_demo
         if is_demo:
             renderer = DemoSplitterRenderer()
         coordinator = SplitterRenderCoordinator(planner=DemoSplitterPlanner(), renderer=renderer, is_demo=is_demo)
@@ -654,6 +680,58 @@ class AppContext(QObject):
         if self.splitter_running:
             self._splitter_thread.stop()
             self._set_splitter_state("stopping", "Stop requested; finishing current part.")
+
+    def start_common_editing_export(self, video_path: str = "", output_path: str = "", settings: Optional[dict] = None) -> None:
+        if self._common_editing_thread is not None and self._common_editing_thread.isRunning():
+            raise RuntimeError("A common editing export is already in progress")
+        session = self.session
+        if session is None:
+            raise ValueError("No project session")
+        from ..services.adapters.common_editing import DemoCommonEditingExporter, LegacyCommonEditingExporter
+        from ..application.common_editing_service import CommonEditingService
+        from .common_editing_export_worker import CommonEditingExportThread
+
+        if session.is_demo:
+            exporter = DemoCommonEditingExporter()
+            is_demo = True
+        else:
+            exporter = LegacyCommonEditingExporter()
+            if not exporter.available():
+                raise ValueError("FFmpeg/FFprobe are unavailable; common editing export cannot run in REAL mode")
+            is_demo = False
+        service = CommonEditingService(exporter=exporter)
+        target = output_path or str(Path(session.output_folder or self._jobs_dir) / "common_editing.mp4")
+        thread = CommonEditingExportThread(service, video_path or (session.source.location if session.source else ""), session, target, settings or {}, parent=self)
+        self._common_editing_thread = thread
+        thread.result.connect(self._on_common_editing_result)
+        thread.error.connect(self._on_common_editing_error)
+        thread.finished.connect(self._on_common_editing_finished)
+        thread.start()
+        self.common_editing_state = "running"
+        self.common_editing_message = "DEMO common editing export running" if is_demo else "REAL common editing export running"
+        self.commonEditingStateChanged.emit(self.common_editing_state, self.common_editing_message)
+
+    def _on_common_editing_result(self, ok) -> None:
+        if ok:
+            self.common_editing_state = "done"
+            self.common_editing_message = "Common editing export finished."
+        else:
+            self.common_editing_state = "failed"
+            self.common_editing_message = "Common editing export failed."
+        self.commonEditingStateChanged.emit(self.common_editing_state, self.common_editing_message)
+
+    def _on_common_editing_error(self, message: str) -> None:
+        self.common_editing_state = "failed"
+        self.common_editing_message = f"Common editing export failed: {message}"
+        self.commonEditingStateChanged.emit(self.common_editing_state, self.common_editing_message)
+
+    def _on_common_editing_finished(self) -> None:
+        thread = self._common_editing_thread
+        if thread is not None:
+            self._common_editing_thread = None
+
+    def common_editing_running(self) -> bool:
+        return self._common_editing_thread is not None and self._common_editing_thread.isRunning()
 
     def _set_splitter_state(self, state: str, message: str) -> None:
         self.splitter_state = state
@@ -682,8 +760,9 @@ class AppContext(QObject):
         thread = self.sender()
         if thread is self._splitter_thread:
             self._splitter_thread = None
-        if thread is not None:
-            thread.deleteLater()
+            self._common_editing_thread = None
+            if thread is not None:
+                thread.deleteLater()
 
     # -- narrator pipeline -------------------------------------------------- #
     @property

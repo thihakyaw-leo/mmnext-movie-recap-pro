@@ -1,0 +1,63 @@
+{
+  "status": "FAIL",
+  "timing_within_video": false,
+  "timing_tolerance_s": 0.25,
+  "source": "Real Python speech recognition tutorial (MIT repository)",
+  "source_url": "https://raw.githubusercontent.com/realpython/python-speech-recognition/master/audio_files/harvard.wav",
+  "source_sha256": "971b4163670445c415c6b0fb6813c38093409ecac2f6b4d429ae3574d24ad470",
+  "fixture": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\inputs\\osr-harvard-12s.mp4",
+  "duration_s": 12.0,
+  "model": "Systran/faster-whisper-tiny.en (local)",
+  "device": "cpu/int8",
+  "elapsed_s": 2.833,
+  "language": "en",
+  "rows": [
+    {
+      "duration": 4.0,
+      "row_id": "s0",
+      "start": 0.0,
+      "text": "The stale smell of old beer lingers."
+    },
+    {
+      "duration": 3.0,
+      "row_id": "s1",
+      "start": 4.0,
+      "text": "It takes heat to bring out the odor."
+    },
+    {
+      "duration": 3.0,
+      "row_id": "s2",
+      "start": 7.0,
+      "text": "A cold dip restores health and zest."
+    },
+    {
+      "duration": 3.0,
+      "row_id": "s3",
+      "start": 10.0,
+      "text": "A salt pickle tastes fine with ham."
+    }
+  ],
+  "audio": {
+    "channels": 1,
+    "rate": 16000,
+    "sample_width": 2,
+    "duration": 12.0
+  },
+  "artifact": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\acceptance-jobs\\osr-harvard-12s_7329af1d\\jobs\\osr-harvard-12s\\narrator\\transcripts\\osr-harvard-12s.transcript.json",
+  "checkpoint": {
+    "completed_units": 4,
+    "fingerprint": "dcd250fe7b964cef9fc168b708b0fd0b6764e1a0",
+    "message": "Transcript artifact committed",
+    "mode": "narrator",
+    "output_path": "J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\acceptance-jobs\\osr-harvard-12s_7329af1d\\jobs\\osr-harvard-12s\\narrator\\transcripts\\osr-harvard-12s.transcript.json",
+    "partial_path": "",
+    "resume_supported": false,
+    "schema_version": 2,
+    "state": "complete",
+    "task_id": "transcribe_osr-harvard-12s",
+    "total_units": 4,
+    "updated_at": "2026-10-20T19:57:22.050752Z"
+  },
+  "last_progress": 100.0,
+  "ui_acceptance": "not exercised by this runner"
+}

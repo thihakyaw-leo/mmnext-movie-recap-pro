@@ -1,0 +1,15 @@
+# SHA-256 of every tracked file AFTER the transcript-reopen fix cycle.
+# 'changed' = hash differs from the No-Git baseline; 'new' = absent before;
+# 'unchanged' = byte-identical to the baseline; 'deleted' = present before, gone now.
+2d32270a80b82faf8cff41961c2800e507bef46a88d7e8596218b75eed619a7a  mmnext/domain/__init__.py  [changed]
+db899ef23ff1fadd2d16c69b6f0fe7fa27dc73a4d8ad985a33f619e76182a3fc  mmnext/domain/models.py  [changed]
+18c142d70076b1126640b82507afe3711d43b567a657f3be518893399ce560b0  mmnext/infrastructure/repository/job_repository.py  [changed]
+c43284b439cafc260877d25d6219de23b2d3fa8581aa50c153ad6a98774a8cb1  mmnext/infrastructure/transcript_adapter.py  [changed]
+262a7e924d22d1a26d3ced0438a3014dbeb3959605266ee122ee00b1ed36282c  mmnext/ui/app_context.py  [changed]
+13ab21ada5775444f0ca13f576fa10a2843ab89ba2c849d60ee238a77edbe08e  tests/test_transcript_open.py  [changed]
+ecff8eaa9d3b35bdf54d5707720aeb1b6c1fdaedc49f31e16c7b6d6ef0808353  todo plan.md  [changed]
+247a5a211ae923f1401f96c4f6e5316db8b508f6ded0cd1f67baf3784e428443  checklist.md  [changed]
+f1c595ffdda2b6686161d1fd8da8f462c39dfaf9dd4a86d54c8d502fb31d7072  mmnext/domain/fingerprint.py  [new]
+ca53121e45a0c6d2ddbaff68e8566b0e4d48f398d37f6befb8f55556212bfbbc  tests/test_fingerprint.py  [new]
+73e7cd39049c408d7b8a564750fe3a73da0d7f95b10e82ce2159da87c5af477b  mmnext/ui/screens/jobs_screen.py  [unchanged]
+0338a4cd4465bd22d9e5a2cb6451a5569fcc5a4d68638c48e81bc5058f2995c3  tests/test_job_repository.py  [unchanged]

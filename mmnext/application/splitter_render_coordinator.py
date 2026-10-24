@@ -50,8 +50,11 @@ class SplitterRenderCoordinator:
             sink(ProgressEvent(percent=percent, stage=stage, message=message))
 
     @staticmethod
-    def _fingerprint(part, settings):
-        return f"{part.number}|{part.start}|{part.end}|{settings.get('ratio')}|{settings.get('fill')}|{settings.get('text')}"
+    def _fingerprint(video_path, part, settings):
+        return (
+            f"{video_path}|{part.number}|{part.start}|{part.end}|"
+            f"{settings.get('ratio')}|{settings.get('fill')}|{settings.get('text')}"
+        )
 
     def run(self, parts, video_path, output_dir, settings=None, sink=None):
         settings = settings or {}
@@ -80,10 +83,11 @@ class SplitterRenderCoordinator:
                 )
             output_path = output_dir / f"part_{part.number}.mp4"
             fingerprint_path = output_path.with_suffix(output_path.suffix + ".fingerprint")
-            fingerprint = self._fingerprint(part, settings)
+            fingerprint = self._fingerprint(video_path, part, settings)
             if output_path.is_file() and fingerprint_path.is_file() and fingerprint_path.read_text(encoding="utf-8").strip() == fingerprint:
                 completed.append(str(output_path))
                 warnings.append(f"Part {part.number}: reused existing output")
+                self.log(warnings[-1])
                 self._emit(sink, (index + 1) / total * 100.0, Stage.RENDER, f"Reused part {index + 1}/{total}")
                 continue
             partial = partial_path_for(output_path)

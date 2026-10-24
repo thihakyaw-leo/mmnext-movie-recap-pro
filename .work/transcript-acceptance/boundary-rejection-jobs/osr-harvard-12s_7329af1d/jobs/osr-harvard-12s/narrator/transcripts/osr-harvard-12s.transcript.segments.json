@@ -1,0 +1,24 @@
+{
+  "fingerprint": "fp2:c6461aeb4cc2222a61c4754c0ee414228e51610e",
+  "rows": [
+    {
+      "duration": 4.0,
+      "row_id": "s0",
+      "start": 0.0,
+      "text": "The stale smell of old beer lingers."
+    },
+    {
+      "duration": 3.0,
+      "row_id": "s1",
+      "start": 4.0,
+      "text": "It takes heat to bring out the odor."
+    },
+    {
+      "duration": 3.0,
+      "row_id": "s2",
+      "start": 7.0,
+      "text": "A cold dip restores health and zest."
+    }
+  ],
+  "schema_version": 1
+}

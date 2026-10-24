@@ -1,0 +1,1614 @@
+--- a/mmnext/domain/__init__.py
++++ b/mmnext/domain/__init__.py
+@@ -5,4 +5,4 @@
+ 
+ from __future__ import annotations
+ 
+-__all__ = ["enums", "models", "events", "validation", "paths"]
++__all__ = ["enums", "models", "events", "validation", "paths", "fingerprint"]
+--- a/mmnext/domain/models.py
++++ b/mmnext/domain/models.py
+@@ -16,7 +16,7 @@
+ 
+ from dataclasses import dataclass, field, replace
+ from pathlib import Path
+-from typing import Optional, Sequence
++from typing import Any, Dict, Optional, Sequence
+ 
+ from .enums import (
+     AppMode,
+@@ -415,6 +415,11 @@
+     schema_version: int = CHECKPOINT_SCHEMA_VERSION
+     updated_at: str = ""
+     message: str = ""
++    # Appended at the end so the positional order of the original fields is
++    # preserved for any existing caller.
++    fingerprint_settings: Dict[str, Any] = field(default_factory=dict)
++    fingerprint_source_type: str = ""
++    fingerprint_schema_version: int = 0
+ 
+     @property
+     def percent(self) -> float:
+@@ -452,6 +457,9 @@
+             "output_path": self.output_path,
+             "resume_supported": self.resume_supported,
+             "fingerprint": self.fingerprint,
++            "fingerprint_settings": dict(self.fingerprint_settings or {}),
++            "fingerprint_source_type": self.fingerprint_source_type,
++            "fingerprint_schema_version": int(self.fingerprint_schema_version or 0),
+             "updated_at": self.updated_at,
+             "message": self.message,
+         }
+@@ -477,6 +485,9 @@
+             output_path=str(data.get("output_path", "") or ""),
+             resume_supported=bool(data.get("resume_supported", False)),
+             fingerprint=str(data.get("fingerprint", "") or ""),
++            fingerprint_settings=dict(data.get("fingerprint_settings", {}) or {}),
++            fingerprint_source_type=str(data.get("fingerprint_source_type", "") or ""),
++            fingerprint_schema_version=int(data.get("fingerprint_schema_version", 0) or 0),
+             schema_version=int(data.get("schema_version", CHECKPOINT_SCHEMA_VERSION) or 0),
+             updated_at=str(data.get("updated_at", "") or ""),
+             message=str(data.get("message", "") or ""),
+@@ -513,6 +524,8 @@
+     output_path: str = ""
+     error_message: str = ""
+     is_demo: bool = True
++    fingerprint: str = ""
++    artifact_path: str = ""
+ 
+     def clone(self) -> "Job":
+         return replace(self, progress=replace(self.progress))
+--- a/mmnext/infrastructure/repository/job_repository.py
++++ b/mmnext/infrastructure/repository/job_repository.py
+@@ -11,14 +11,17 @@
+ from __future__ import annotations
+ 
+ import hashlib
+-import json
+-import os
+ from dataclasses import asdict
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
+ from mmnext.domain.enums import AppMode, JobState, TaskState, SourceType, Stage
++from mmnext.domain.fingerprint import (
++    FingerprintError,
++    canonical_fingerprint,
++    normalize_source_path,
++)
+ from mmnext.domain.models import Job, JobProgress, JobCheckpoint, VideoSource
+ from mmnext.domain.paths import atomic_write_json, read_json, safe_name
+ from mmnext.domain.models import CHECKPOINT_SCHEMA_VERSION
+@@ -28,12 +31,16 @@
+     "JobRepository",
+     "FingerprintError",
+     "ResumeCheckResult",
++    "canonical_fingerprint",
++    "normalize_source_path",
+ ]
+ 
+ JOB_SCHEMA_VERSION = 1
+ 
+-class FingerprintError(ValueError):
+-    pass
++# ``FingerprintError`` is re-exported from the domain layer so there is
++# exactly one exception type for the canonical fingerprint contract.  The
++# domain never imports infrastructure, so this alias cannot create a cycle.
++
+ 
+ class ResumeCheckResult:
+     """Structured result for a resume eligibility check."""
+@@ -51,19 +58,6 @@
+ def _iso_now() -> str:
+     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+ 
+-def _sha1_hex(data: bytes) -> str:
+-    return hashlib.sha1(data).hexdigest()
+-
+-def _source_identity(source_path: str, source_type: str) -> str:
+-    return f"{source_type}:{source_path}"
+-
+-def _file_meta(path: str) -> Tuple[int, float]:
+-    try:
+-        st = os.stat(path)
+-        return int(st.st_size), float(st.st_mtime)
+-    except OSError:
+-        return 0, 0.0
+-
+ def compute_fingerprint(
+     source_path: str,
+     source_type: str,
+@@ -71,12 +65,24 @@
+     settings: Optional[Dict[str, Any]] = None,
+     schema_version: int = JOB_SCHEMA_VERSION,
+ ) -> str:
+-    settings = settings or {}
+-    settings_bytes = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+-    size, mtime = _file_meta(source_path) if source_type == "local" else (0, 0.0)
+-    raw = f"{_source_identity(source_path, source_type)}|{size}|{mtime:.3f}|{mode.value}|{schema_version}|"
+-    raw_bytes = raw.encode("utf-8") + settings_bytes
+-    return _sha1_hex(raw_bytes)
++    """Return the canonical fingerprint of one artefact's inputs.
++
++    The public name and keyword signature are kept for callers that already
++    use this helper, but the algorithm now lives in exactly one place:
++    :func:`mmnext.domain.fingerprint.canonical_fingerprint`.  The historic
++    implementation hashed a *different* payload than the transcript adapter
++    and only stat'ed the source when the source type was the literal string
++    ``"local"`` - never for the real enum value ``"local_file"``.  Both
++    defects are gone; a repository-computed value and an adapter-computed
++    value for the same inputs are now byte-identical.
++    """
++    return canonical_fingerprint(
++        source_path,
++        source_type,
++        mode,
++        settings=settings,
++        schema_version=schema_version,
++    )
+ 
+ 
+ class JobRepository:
+@@ -139,6 +145,7 @@
+                 "duration_s": job.source.duration_s if job.source else 0.0,
+             } if job.source else None,
+             "fingerprint": getattr(job, "fingerprint", ""),
++            "artifact_path": getattr(job, "artifact_path", ""),
+         }
+         return data
+ 
+@@ -200,6 +207,8 @@
+             output_path=str(data.get("output_path", "") or ""),
+             error_message=str(data.get("error_message", "") or ""),
+             is_demo=bool(data.get("is_demo", True)),
++            fingerprint=str(data.get("fingerprint", "") or ""),
++            artifact_path=str(data.get("artifact_path", "") or ""),
+         )
+         return job
+ 
+@@ -327,9 +336,11 @@
+ 
+     def scan(self) -> Dict[str, List[Any]]:
+         recoverable: List[Tuple[Job, str]] = []
++        completed: List[Tuple[Job, str]] = []
++        completed_real: List[Tuple[Job, str]] = []
+         corrupt: List[Path] = []
+         if not self.jobs_dir.exists():
+-            return {"recoverable": [], "corrupt": []}
++            return {"recoverable": [], "completed": [], "completed_real": [], "corrupt": []}
+         for src_dir in self.jobs_dir.iterdir():
+             if not src_dir.is_dir():
+                 continue
+@@ -352,12 +363,54 @@
+                         corrupt.append(meta_path)
+                         continue
+                     job = self._dict_to_job(data)
+-                    if job.state not in (JobState.COMPLETE, JobState.CANCELLED):
++                    if job.state == JobState.COMPLETE:
++                        completed.append((job, str(src_dir)))
++                        if not job.is_demo:
++                            completed_real.append((job, str(src_dir)))
++                    elif job.state not in (JobState.CANCELLED,):
+                         recoverable.append((job, str(src_dir)))
+                 except Exception:
+                     corrupt.append(meta_path)
+                     continue
+-        return {"recoverable": recoverable, "corrupt": corrupt}
++        return {
++            "recoverable": recoverable,
++            "completed": completed,
++            "completed_real": completed_real,
++            "corrupt": corrupt,
++        }
++
++    def completed_jobs(self) -> List[Job]:
++        """Return list of completed REAL jobs (excluding demo and cancelled)."""
++        all_jobs = self.list_jobs()
++        return [j for j in all_jobs if j.state == JobState.COMPLETE and not j.is_demo]
++
++    def list_completed_real(self, source_path: Optional[str] = None) -> List[Job]:
++        """Return completed, non-demo jobs as a flat list of :class:`Job`.
++
++        Completed REAL jobs are discovered from disk so the Jobs screen can
++        offer "open transcript" for work that was finished in an earlier
++        session.  Nothing is resumed or opened automatically - discovery
++        only.  When ``source_path`` is given only jobs belonging to that
++        source are returned.
++        """
++        jobs = self.completed_jobs()
++        if source_path:
++            try:
++                wanted = normalize_source_path(source_path)
++            except Exception:
++                wanted = str(source_path)
++            filtered: List[Job] = []
++            for job in jobs:
++                if not job.source:
++                    continue
++                try:
++                    have = normalize_source_path(job.source.location)
++                except Exception:
++                    have = str(job.source.location)
++                if have == wanted:
++                    filtered.append(job)
++            return filtered
++        return jobs
+ 
+     def can_resume_job(self, job_id: str, source_path: str, mode: AppMode) -> ResumeCheckResult:
+         job = self.load(job_id, source_path)
+@@ -380,9 +433,10 @@
+             return ResumeCheckResult(False, [f"Checkpoint state not resumable: {ckpt.state.value}"])
+         current_fp = compute_fingerprint(
+             source_path,
+-            job.source.source_type.value if job.source else "",
++            ckpt.fingerprint_source_type or (job.source.source_type.value if job.source else ""),
+             mode,
+-            schema_version=JOB_SCHEMA_VERSION,
++            settings=ckpt.fingerprint_settings or None,
++            schema_version=ckpt.fingerprint_schema_version or JOB_SCHEMA_VERSION,
+         )
+         if ckpt.fingerprint and ckpt.fingerprint != current_fp:
+             return ResumeCheckResult(False, ["Fingerprint mismatch"])
+--- a/mmnext/infrastructure/transcript_adapter.py
++++ b/mmnext/infrastructure/transcript_adapter.py
+@@ -1,8 +1,6 @@
+ """Local transcript adapters. Real work never falls back to demo rows."""
+ from __future__ import annotations
+ 
+-import hashlib
+-import json
+ import math
+ import os
+ import subprocess
+@@ -13,6 +11,7 @@
+ from ..domain.models import TranscriptRow, JobCheckpoint
+ from ..domain.events import ProgressEvent, LogEvent
+ from ..domain.enums import Stage, TaskState, AppMode
++from ..domain.fingerprint import FINGERPRINT_SCHEMA_VERSION, canonical_fingerprint
+ from ..domain.paths import atomic_write_json
+ from .repository.job_repository import JobRepository
+ 
+@@ -60,6 +59,7 @@
+         self._detected_language = ""
+         self._duration = 0.0
+         self._fingerprint_value = ""
++        self._fingerprint_settings_value: dict = {}
+         # Keep the v1 file name, but scope its parent to source and mode to
+         # prevent two same-stem videos or modes overwriting one another.
+         self.work_dir = self.repo._job_dir(self.job_id, source_path) / mode.value
+@@ -85,9 +85,14 @@
+         if Path(media_path).resolve() != Path(self.source_path).resolve():
+             raise ValueError("Transcript source does not match job source")
+         self._fingerprint_value = self._fingerprint(media_path, language, auto_detect)
++        self._fingerprint_settings_value = self._fingerprint_settings(language, auto_detect)
+         ckpt = JobCheckpoint(task_id=self.task_id, mode=self.mode.value,
+                              state=TaskState.RUNNING, resume_supported=False,
+-                             fingerprint=self._fingerprint_value, message="Probing local media")
++                             fingerprint=self._fingerprint_value,
++                             fingerprint_settings=dict(self._fingerprint_settings_value),
++                             fingerprint_source_type="local_file",
++                             fingerprint_schema_version=FINGERPRINT_SCHEMA_VERSION,
++                             message="Probing local media")
+         self._save(ckpt)
+         try:
+             self._check_stop(ckpt)
+@@ -194,24 +199,49 @@
+         if not self.is_demo:
+             for row in rows:
+                 self._validate_segment_timing(row.row_id, row.start, row.end, duration)
++        if not self._fingerprint_value:
++            # Direct writer calls (outside ``transcribe``) still produce a
++            # self-consistent artefact: the fingerprint and the settings
++            # that produced it are both derived from the same inputs.
++            self._fingerprint_settings_value = self._fingerprint_settings(language, False)
++            self._fingerprint_value = self._fingerprint(media_path, language, False)
+         atomic_write_json(self.artifact_path, {
+             "schema_version": 1, "source_path": media_path,
+             "fingerprint": self._fingerprint_value, "model": self.whisper_model,
+             "language": language, "duration_s": duration, "created_at": self._now(),
+             "is_demo": self.is_demo,
++            # The mode and the exact fingerprint inputs travel with the
++            # artefact so a re-open can re-derive the same canonical value
++            # instead of guessing which settings produced it.
++            "mode": self.mode.value,
++            "fingerprint_settings": dict(self._fingerprint_settings_value),
++            "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
++            "fingerprint_source_type": "local_file",
+             "rows": [{"row_id": r.row_id, "start": r.start, "duration": r.duration, "text": r.text} for r in rows],
+         })
+         return self.artifact_path
+ 
+     def _fingerprint(self, media_path, language, auto_detect):
++        """Return the canonical fingerprint of this transcription's inputs.
++
++        The exact settings dict that is hashed is returned alongside the
++        value so the transcript artefact can carry it verbatim.  A consumer
++        that re-hashes those settings with the canonical function gets the
++        same value, which is what makes re-opening a stored transcript
++        verifiable instead of guessable.
++        """
+         settings = {"language": language, "auto_detect": auto_detect, "model": self.whisper_model, "schema": 1}
+-        try:
+-            stat = os.stat(media_path)
+-            size, mtime = stat.st_size, stat.st_mtime_ns
+-        except OSError:
+-            size, mtime = 0, 0
+-        raw = f"{Path(media_path).resolve()}|{size}|{mtime}|{self.mode.value}|" + json.dumps(settings, sort_keys=True)
+-        return hashlib.sha1(raw.encode()).hexdigest()
++        return canonical_fingerprint(
++            media_path,
++            "local_file",
++            self.mode,
++            settings=settings,
++            schema_version=FINGERPRINT_SCHEMA_VERSION,
++        )
++
++    def _fingerprint_settings(self, language, auto_detect):
++        """The exact settings dict hashed into the fingerprint."""
++        return {"language": language, "auto_detect": auto_detect, "model": self.whisper_model, "schema": 1}
+ 
+     def _validate_segment_timing(self, row_id, start, end, duration):
+         if (not all(math.isfinite(v) for v in (start, end, duration))
+--- a/mmnext/ui/app_context.py
++++ b/mmnext/ui/app_context.py
+@@ -10,6 +10,8 @@
+ 
+ from __future__ import annotations
+ 
++import math
++from pathlib import Path
+ from typing import Optional
+ 
+ from PySide6.QtCore import QObject, Signal
+@@ -17,17 +19,21 @@
+ from ..application.download_controller import DownloadController, DownloadEvent
+ from ..application.job_manager import JobManager
+ from ..application.mode_coordinators import ModeCoordinator, build_coordinator
++from ..application.narrator_coordinator import NarratorPlanCoordinator
+ from ..application.project_controller import ProjectController
+ from ..domain.enums import AppMode, JobState, Stage, TaskState
+ from ..domain.models import (
+     DownloadItem,
+     Job,
+     LogEntry,
++    NarrationSegment,
+     ProjectSession,
+     SourceMetadata,
++    TranscriptRow,
+     ValidationReport,
+     VideoSource,
+ )
++from ..services.adapters.narrator import NarratorPlanningService
+ from ..services.demo.demo_providers import DemoDownloadService, DemoMetadataService
+ from ..services.demo import demo_data
+ 
+@@ -147,10 +153,17 @@
+         self.selection = SelectionModel(self)
+         self.dirty = DirtyGuard(self.project, self)
+ 
++        # Narrator plan coordinator (Qt-free). The legacy planner, when
++        # available, is wrapped defensively; otherwise a deterministic
++        # one-unit-per-row fallback is used. Never touches exact-dubbing rows.
++        self._narrator_planner = NarratorPlanningService()
++        self._narrator_coordinator = NarratorPlanCoordinator(self._narrator_planner)
++
+         # Stable user-writable jobs directory
+         from pathlib import Path
+         if jobs_dir is None:
+-            jobs_dir = str(Path.home() / ".mmnext" / "jobs")
++            import os
++            jobs_dir = os.environ.get("MMNEXT_JOBS_DIR") or str(Path.home() / ".mmnext" / "jobs")
+         self._jobs_dir = jobs_dir
+         Path(self._jobs_dir).mkdir(parents=True, exist_ok=True)
+         # Phase 2: repository-backed startup scan
+@@ -275,14 +288,18 @@
+             return
+         scan = self._job_repository.scan()
+         for job, src_dir in scan.get("recoverable", []):
+-            # Avoid duplicate job IDs from demo data
+             try:
+                 self.jobs.add(job)
+             except ValueError:
+-                # Already present
+                 pass
+-        # Corrupt jobs are reported but never auto-deleted
+-        # Log corrupt paths for diagnostics
++        # Completed REAL transcript jobs are discoverable for explicit reopen.
++        for job, src_dir in scan.get("completed", []):
++            if getattr(job, "is_demo", False):
++                continue
++            try:
++                self.jobs.add(job)
++            except ValueError:
++                pass
+         for corrupt_path in scan.get("corrupt", []):
+             self.append_log(LogEntry(message=f"Corrupt job record detected: {corrupt_path}", stage=Stage.IDLE))
+ 
+@@ -331,6 +348,28 @@
+             self._transcript_thread.stop()
+             self._set_transcript_state("stopping", "Stop requested; waiting for current operation/segment and durable checkpoint. No resume; restart only.")
+ 
++    def plan_narration(self, video_duration: Optional[float] = None) -> list[NarrationSegment]:
++        """Plan narrator segments from the current verbatim transcript.
++
++        Runs the pure-Python planner off the GUI thread boundary (the planner
++        itself is fast; heavy FFmpeg/Whisper work stays on the transcript
++        worker). Results attach to the active session without touching the
++        exact-dubbing working set.
++        """
++        if self.project.session is None:
++            raise ValueError("No project session")
++        session = self.project.session
++        rows = self.project.transcript()
++        if not rows:
++            raise ValueError("No verbatim transcript rows to plan from")
++        duration = float(video_duration) if video_duration is not None else session.total_duration()
++        if duration <= 0:
++            raise ValueError("No source duration to plan against")
++        segments = self._narrator_coordinator.plan(rows, duration)
++        self.project.set_narration_segments(segments)
++        self.sessionChanged.emit()
++        return segments
++
+     def open_transcript_from_job(self, job_id: str, source_path: str) -> None:
+         """Load a completed REAL transcript artifact into the workspace with strict validation."""
+         if self._job_repository is None:
+@@ -340,9 +379,6 @@
+         job = self._job_repository.load(job_id, source_path)
+         if job is None:
+             raise FileNotFoundError(f"Job {job_id} not found for source {source_path}")
+-        if job.state != self.jobs.get(job_id).state:
+-            # ensure state matches in-memory job manager
+-            pass
+         # Validate job state
+         from ..domain.enums import JobState
+         if job.state != JobState.COMPLETE:
+@@ -387,17 +423,31 @@
+             raise ValueError("Transcript artifact contains no rows")
+         from ..domain.models import TranscriptRow, VideoSource, ProjectSession
+         rows = []
++        seen_ids = set()
++        artifact_duration = float(data.get("duration_s", 0.0) or 0.0)
+         for r in rows_raw:
+             try:
+                 row_id = str(r["row_id"])
+                 start = float(r["start"])
+-                duration = float(r["duration"])
++                row_duration = float(r["duration"])
+                 text = str(r["text"])
+             except Exception as exc:
+                 raise ValueError(f"Invalid transcript row: {exc}")
+-            if not row_id or start < 0 or duration <= 0:
+-                raise ValueError(f"Invalid timing for row {row_id}")
+-            rows.append(TranscriptRow(row_id=row_id, start=start, duration=duration, text=text))
++            if not row_id:
++                raise ValueError(f"Empty row_id in transcript artifact")
++            if row_id in seen_ids:
++                raise ValueError(f"Duplicate row_id {row_id} in transcript artifact")
++            seen_ids.add(row_id)
++            if not (math.isfinite(start) and start >= 0):
++                raise ValueError(f"Invalid start time for row {row_id}: {start}")
++            if not (math.isfinite(row_duration) and row_duration > 0):
++                raise ValueError(f"Invalid duration for row {row_id}: {row_duration}")
++            end = start + row_duration
++            if not math.isfinite(end):
++                raise ValueError(f"Invalid end time for row {row_id}: {end}")
++            if artifact_duration > 0 and end > artifact_duration + 0.01:
++                raise ValueError(f"Row {row_id} end {end}s exceeds artifact duration {artifact_duration}s")
++            rows.append(TranscriptRow(row_id=row_id, start=start, duration=row_duration, text=text))
+         # Build session and apply transcript
+         source = VideoSource.local(job.source.location)
+         output_folder = str(job_dir.parent.parent)
+@@ -439,6 +489,7 @@
+                 job_id = provider.job_id
+                 source_type = self.session.source.source_type.value if self.session.source else ""
+                 fp = compute_fingerprint(source_path, source_type, mode, schema_version=1)
++                artifact_path = str(provider.artifact_path) if hasattr(provider, "artifact_path") else ""
+                 job = Job(
+                     job_id=job_id,
+                     title=Path(source_path).name,
+@@ -447,11 +498,14 @@
+                     is_demo=False,
+                     source=VideoSource.local(source_path),
+                     progress=JobProgress(percent=100.0),
++                    fingerprint=fp,
++                    output_path=artifact_path,
+                 )
+                 self._job_repository.save(job, source_path)
+-            except Exception:
+-                # Persistence failure should not block transcript display
+-                pass
++            except Exception as exc:
++                self._set_transcript_state("failed", f"Failed to persist transcript job: {exc}")
++                self.append_log(LogEntry(stage=Stage.TRANSCRIBE, message=f"Job persistence failed: {exc}"))
++                return
+         self._set_transcript_state("complete", f"REAL transcript: {len(rows)} rows, language={language}. Artifact: {provider.artifact_path}. Narrator plan not generated.")
+ 
+     def _on_transcript_thread_finished(self) -> None:
+--- a/tests/test_transcript_open.py
++++ b/tests/test_transcript_open.py
+@@ -59,7 +59,10 @@
+     ctx = AppContext(jobs_dir=str(jobs_dir))
+     ctx._job_repository = repo
+     # Need a job in manager
+-    ctx.jobs.add(job)
++    try:
++        ctx.jobs.add(job)
++    except ValueError:
++        pass
+     ctx.open_transcript_from_job(job_id, source_path)
+     session = ctx.project.session
+     assert session is not None
+@@ -83,7 +86,10 @@
+     repo.save(job, source_path)
+     ctx = AppContext(jobs_dir=str(jobs_dir))
+     ctx._job_repository = repo
+-    ctx.jobs.add(job)
++    try:
++        ctx.jobs.add(job)
++    except ValueError:
++        pass
+     with pytest.raises(FileNotFoundError):
+         ctx.open_transcript_from_job(job_id, source_path)
+ 
+@@ -101,7 +107,10 @@
+     write_transcript_artifact(repo, job_id, source_path, mode, rows, is_demo=True)
+     ctx = AppContext(jobs_dir=str(jobs_dir))
+     ctx._job_repository = repo
+-    ctx.jobs.add(job)
++    try:
++        ctx.jobs.add(job)
++    except ValueError:
++        pass
+     with pytest.raises(ValueError, match="demo"):
+         ctx.open_transcript_from_job(job_id, source_path)
+ 
+@@ -157,7 +166,10 @@
+     })
+     ctx = AppContext(jobs_dir=str(jobs_dir))
+     ctx._job_repository = repo
+-    ctx.jobs.add(job)
++    try:
++        ctx.jobs.add(job)
++    except ValueError:
++        pass
+     with pytest.raises(ValueError, match="source path"):
+         ctx.open_transcript_from_job(job_id, source_path)
+ 
+@@ -175,7 +187,10 @@
+     write_transcript_artifact(repo, job_id, source_path, mode, rows, is_demo=False)
+     ctx = AppContext(jobs_dir=str(jobs_dir))
+     ctx._job_repository = repo
+-    ctx.jobs.add(job)
++    try:
++        ctx.jobs.add(job)
++    except ValueError:
++        pass
+     ctx.open_transcript_from_job(job_id, source_path)
+     session = ctx.project.session
+     row = session.exact_dubbing_rows[0]
+--- a/todo plan.md
++++ b/todo plan.md
+@@ -10,20 +10,138 @@
+ 
+ Fresh verification for this documentation update: `pytest tests -q --confcutdir=tests -p no:cacheprovider` with the approved local media/model fixture and project-local FFmpeg tools enabled: **291 passed in 63.32s**. Focused saved-transcript tests: `pytest tests/test_transcript_open.py -q --confcutdir=tests -p no:cacheprovider` → **6 passed in 0.27s**. This does not establish full product or clean-machine readiness.
+ 
++> **Superseding audit — later the same day, after the transcript reopen / canonical
++> fingerprint fix cycle.** The paragraph above is kept as dated history. The
++> current, source-verified state is recorded in
++> **§ Current verified status — canonical fingerprint fix cycle** below, and
++> the counts below supersede "291 passed" wherever they disagree.
++>
++> What changed: the repository/adapter fingerprint divergence is fixed by a
++> single canonical algorithm in `mmnext/domain/fingerprint.py`; the jobs root
++> **is** configured in normal startup; completed REAL transcript jobs **are**
++> now discoverable; and the reopen path **does** compare the saved fingerprint.
++> What did **not** change: the reopen path is still not end-to-end complete —
++> the artifact JSON is still read on the GUI thread, the reopen fingerprint
++> comparison is still computed without the artifact's settings (so a real
++> artifact is currently rejected), artifact mode is still not compared, and
++> legacy artifacts are still not rejected explicitly. See
++> `checklist.md` § P for the per-item truth table.
++
+ The Jobs screen and `AppContext.open_transcript_from_job()` contain an explicit open path, but it is **not yet a complete restart-to-Workspace flow**: normal `MainWindow` construction does not pass a persistent jobs directory, the transcript adapter writes transcript/checkpoint artifacts but does not create completed Job metadata, and the saved transcript fingerprint is not checked when reopening. Artifact JSON is also read synchronously from the UI action. Treat this as partially implemented, not end-to-end complete.
+ 
++> **Correction to the paragraph above (canonical fingerprint fix cycle).**
++> Three of its four claims are now stale and are superseded by
++> **§ Current verified status — canonical fingerprint fix cycle**:
++> the jobs root **is** configured in normal startup (`AppContext` resolves it
++> itself), a COMPLETE REAL Job record **is** persisted after a successful
++> transcript, and the reopen path **does** compare the saved fingerprint.
++> The claims that still hold: the restart-to-Workspace flow is not complete,
++> and the artifact JSON is still read synchronously on the GUI thread.
++
+ ### Highest-priority next work: make persisted transcript reopening/recovery real end to end
+ 
+-- [ ] First obtain an independent, read-only NVIDIA Nemotron review of the current Step-5 transcript-reopen code using `outputs/nemotron-review-prompt-step5-transcript-reopen.md`; treat reported claims as unverified until checked against source/tests.
+-- [ ] Configure and document one persistent, user-writable jobs root in normal application startup; keep demo mode explicit.
++- [x] First obtain an independent, read-only NVIDIA Nemotron review of the current Step-5 transcript-reopen code using `outputs/nemotron-review-prompt-step5-transcript-reopen.md`; treat reported claims as unverified until checked against source/tests.
++  - Done. Verdict: **REJECT** — 16 findings, 7 critical. Every finding was
++  re-verified against source and by running the code, and the fix cycle that
++  followed is recorded below.
++- [x] Configure and document one persistent, user-writable jobs root in normal application startup; keep demo mode explicit.
++  - Done. `AppContext` resolves `$MMNEXT_JOBS_DIR`, else `~/.mmnext/jobs`, and
++  always constructs the `JobRepository`. Demo and REAL stay separated by
++  `Job.is_demo`.
+ - [ ] Persist a versioned REAL transcript Job record, including COMPLETE state and the committed artifact location, only after transcript validation and atomic artifact commit succeed.
++  - Largely done in the UI layer; `Job.fingerprint` and `Job.artifact_path`
++  now round-trip through the metadata.
+ - [ ] Make repository-backed Jobs listing include eligible completed REAL transcript jobs as well as recoverable incomplete jobs; opening remains explicit and must never auto-resume.
++  - Discovery is done (`scan()["completed_real"]`, `list_completed_real()`);
++  the Jobs screen wiring and the real open path are not finished.
+ - [ ] Harden reopen validation: source identity and fingerprint, mode, job/artifact schema, completion state, row uniqueness, and timing bounds. Reject failures without demo fallback or source-row mutation.
++  - Partly done. State, schema, source identity/fingerprint, row uniqueness and
++  timing bounds are in place; artifact `mode`, legacy-artifact rejection, and
++  artifact path containment are not.
+ - [ ] Move artifact reading/validation off the GUI thread and bind results only if the selected job/source is still current.
++  - Not done.
+ - [ ] Add UI/integration tests for normal startup, completed-job discovery, explicit open, corrupt/missing/incompatible artifacts, source/fingerprint/mode mismatch, no demo fallback, off-GUI-thread loading, and Exact Dubbing invariants.
++  - Partly done. `tests/test_fingerprint.py` (40 tests) covers the fingerprint
++  contract, discovery and row validation; a real adapter-artifact reopen test
++  and an off-GUI-thread load test are still missing.
+ 
+ Do not begin translation, TTS, or final video rendering until this persistence/recovery slice has a truthful end-to-end acceptance path. After it, prioritize a real Narrator vertical slice, then Exact Dubbing, Splitter, Common Editing, and release hardening.
+ 
++## Current verified status — canonical fingerprint fix cycle
++
++This section supersedes the dated "291 passed" figures and the stale
++`jobs_dir` claims in the section above wherever the two disagree. It records
++what was **actually verified by running the code**, not what is intended.
++
++### Fresh verification
++
++- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **342 passed, 1 skipped in 70.89s**. The one skip is `tests/test_transcript_regressions.py:158`, which needs an approved media fixture and a locally cached Whisper model.
++- `.\.venv\Scripts\python.exe -m pytest tests\test_fingerprint.py -q --confcutdir=tests -p no:cacheprovider` → **40 passed in 1.61s** (new canonical-fingerprint suite).
++- `.\.venv\Scripts\python.exe -m pytest tests\test_job_repository.py tests\test_transcript_regressions.py tests\test_transcript_integration.py tests\test_real_transcript.py -q --confcutdir=tests -p no:cacheprovider` → **70 passed, 1 skipped in 2.73s**.
++- `.\.venv\Scripts\python.exe -m pytest tests\test_transcript_open.py tests\test_job_repository.py tests\test_live_transcript_workspace.py -q --confcutdir=tests -p no:cacheprovider` → **32 passed in 11.17s**.
++
++### What the fix cycle actually changed
++
++- **One canonical fingerprint algorithm.** `mmnext/domain/fingerprint.py` (new) owns
++  `canonical_fingerprint(source_path, source_type, mode, settings=None, schema_version=...)`
++  and returns `fp2:<sha1hex>`. `JobRepository.compute_fingerprint()` keeps its
++  public name and keyword signature and now delegates to it, and
++  `WhisperTranscriptAdapter._fingerprint()` delegates to it as well. The two
++  algorithms that previously disagreed now produce identical values.
++- **Local file identity is real.** The old code only stat'ed the file when
++  `source_type == "local"`, but the enum value is `"local_file"`, so size and
++  mtime were always `(0, 0.0)`. Source types are now normalised
++  (`local`/`local_file`/`file` → `local_file`, `youtube`/`url` → `youtube`),
++  and an absent source is hashed with an explicit "absent" marker so it can
++  never match a present one.
++- **The artifact carries its own fingerprint inputs.** The transcript artifact
++  now stores `mode`, `fingerprint`, `fingerprint_settings`
++  (`language`/`auto_detect`/`model`/`schema`), `fingerprint_schema_version`, and
++  `fingerprint_source_type`, so a re-open can re-derive the same value instead
++  of guessing which settings produced it.
++- **Completed REAL transcript jobs are discoverable.**
++  `JobRepository.scan()` returns `recoverable`, `completed`, `completed_real`,
++  and `corrupt`; `list_completed_real(source_path=None)` returns the matching
++  `Job` objects. `Job.fingerprint` round-trips through the metadata
++  serialisation, and legacy metadata without the key loads as `""`.
++- **The jobs root is configured in normal startup.** `AppContext` resolves a
++  default jobs directory itself (`$MMNEXT_JOBS_DIR`, else `~/.mmnext/jobs`) and
++  always constructs the `JobRepository`, so `MainWindow` constructing
++  `AppContext()` with no argument is no longer a blocker. Verified by running
++  `AppContext()` with no argument: the repository is present and the scan
++  returns all four keys.
++- **No-Git review evidence exists.** `.work/review-baselines/transcript-reopen-fixcycle-01/`
++  holds the pre-edit byte copies, `manifest.sha256`, `changes.diff`, and
++  `changed-files.sha256`.
++
++### What is still NOT true
++
++- **The reopen path currently rejects every real artifact.** The reopen check
++  still recomputes the fingerprint without the artifact's settings, so a
++  REAL adapter-produced artifact fails with
++  `ValueError: Fingerprint mismatch between artifact and current source`
++  (verified by running the full save → reopen path against a real adapter
++  artifact). The fix is to recompute from `fingerprint_settings` /
++  `fingerprint_source_type` / `fingerprint_schema_version`.
++- **Artifact mode is not compared.** The artifact now carries `mode`, but the
++  reopen path does not check it against the persisted Job mode or the
++  workspace mode.
++- **Legacy artifacts are not rejected explicitly.** An artifact without the new
++  keys, or with a non-`fp2:` fingerprint, is unverifiable and must be
++  refused with a clear "legacy artifact — re-transcribe required" message
++  instead of being silently accepted.
++- **Artifact reading is still synchronous on the GUI thread**, and there is
++  still no stale-result guard on the open path.
++- **No artifact path containment check** is performed.
++- **The narration planning path and the `MMNEXT_JOBS_DIR` override landed in
++  the same window** as the sibling's reopen-path rewrite; the narration
++  planning work is out of scope for this slice and is not claimed here.
++
++Do not begin translation, TTS, or final video rendering until this
++persistence/recovery slice has a truthful end-to-end acceptance path. After
++it, prioritize a real Narrator vertical slice, then Exact Dubbing, Splitter,
++Common Editing, and release hardening.
++
+ ## Phase 0 — Baseline and decisions
+ 
+ - [ ] Create a clean feature branch or isolated worktree for MMNext.
+@@ -44,8 +162,8 @@
+ 
+ > **Status: UI-shell milestone complete.** The original milestone run had 145
+ > passing tests; that count is historical, not current. The latest full-suite
+-> result is **291 passed** in the current status section above. Evidence is
+-> cited in `checklist.md` §§ B, K, N, and O.
++> result is **342 passed, 1 skipped** in the current status section above.
++> Evidence is cited in `checklist.md` §§ B, K, N, O, and P.
+ 
+ ### Application shell
+ 
+@@ -259,17 +377,21 @@
+ 
+ - [x] PySide6 UI tests and basic smoke test pass.
+   - Historical Phase 1 baseline: **145 passed**. Current full-suite result:
+-  **291 passed**, recorded in `checklist.md` § O.
++  **342 passed, 1 skipped**, recorded in `checklist.md` §§ O and P.
+   - `python scripts\check_shell.py` → exit 0.
+ 
+ ## Phase 2 — Domain models and job state
+ 
+-> **Status: partially implemented and not fully wired into normal startup.**
+-> `JobRepository` provides versioned metadata/checkpoints, atomic writes,
+-> fingerprints, recovery scanning, and resume-eligibility checks. `AppContext`
+-> creates/scans it only when `jobs_dir` is supplied; `MainWindow` currently
+-> constructs `AppContext()` without one. The transcript adapter saves its
+-> artifact and checkpoint but does not persist completed Job metadata.
++> **Status: partially implemented.** `JobRepository` provides versioned
++> metadata/checkpoints, atomic writes, fingerprints, recovery scanning, and
++> resume-eligibility checks. **Corrected:** `AppContext` now always resolves a
++> jobs directory itself (`$MMNEXT_JOBS_DIR`, else `~/.mmnext/jobs`) and always
++> constructs the `JobRepository`, so the old claim that "it creates/scans it
++> only when `jobs_dir` is supplied" is no longer true — `MainWindow`
++> constructing `AppContext()` with no argument is fine today. The transcript
++> adapter still saves its artifact and checkpoint but does not itself persist
++> completed Job metadata; that is done by the UI layer after a successful
++> transcript.
+ 
+ - [x] Define typed models and enums.
+   - `mmnext/domain/models.py` (18 dataclasses), `mmnext/domain/enums.py`
+@@ -286,8 +408,12 @@
+ 
+ - [x] Implement project/job repository abstraction.
+   - `mmnext/infrastructure/repository/job_repository.py` implements versioned
+-  disk-backed metadata/checkpoint persistence. Normal startup and completed
+-  transcript Job creation/listing remain unwired; see the priority slice above.
++  disk-backed metadata/checkpoint persistence. The repository is now
++  constructed on every normal startup (see the corrected status note above).
++  Completed REAL transcript Job creation happens in the UI layer after a
++  successful transcript, and completed jobs are listed by
++  `list_completed_real()` / `scan()["completed_real"]`; the restart-to-open
++  path is still not end-to-end complete.
+ 
+ - [x] Implement schema versioning for current records.
+   - Job metadata uses schema v1, checkpoints use the domain checkpoint schema,
+@@ -299,22 +425,33 @@
+   `test_workers.py::test_checkpoint_write_is_atomic`.
+ 
+ - [x] Implement source/settings/mode/schema fingerprint helpers.
+-  - `compute_fingerprint()` covers source identity and local file size/mtime,
+-  mode, schema version, and settings; the transcript adapter records its own
+-  source/model/language fingerprint. Reopen does **not** compare the saved
+-  transcript fingerprint with the current source; general artifact reuse and
+-  invalidation are incomplete.
++  - `mmnext/domain/fingerprint.py::canonical_fingerprint()` is now the single
++  algorithm for source identity, local file size/mtime, mode, schema version,
++  and settings. `JobRepository.compute_fingerprint()` and
++  `WhisperTranscriptAdapter._fingerprint()` both delegate to it, so the two
++  previously divergent values now agree. The transcript artifact stores the
++  exact `fingerprint_settings` that were hashed, so a re-open can re-derive
++  the value. The reopen comparison is implemented but currently recomputes
++  without those settings and therefore rejects real artifacts — see the
++  "What is still NOT true" list. General artifact reuse and invalidation are
++  still incomplete.
+ 
+ - [x] Implement repository scan for recoverable and corrupt job records.
+-  - `JobRepository.scan()` discovers incomplete records and corrupt metadata.
+-  `AppContext` invokes it only when configured with `jobs_dir`; standard
+-  `MainWindow` startup does not currently supply that configuration.
++  - `JobRepository.scan()` discovers incomplete records, completed records,
++  completed REAL records (`scan()["completed_real"]`), and corrupt metadata.
++  `AppContext` invokes it on every startup, because `AppContext` always
++  resolves a jobs directory for itself. **Corrected:** the previous claim that
++  "standard `MainWindow` startup does not currently supply that configuration"
++  was stale — verified by running `AppContext()` with no argument.
+ 
+ - [ ] Wire repository-discovered jobs into the normal Jobs screen, including
+   completed REAL transcript records.
+-  - The Jobs screen displays jobs already held by `JobManager`, and `AppContext`
+-  can add recoverable jobs after a configured scan. Normal startup does not
+-  configure the repository, and the scan does not add completed records.
++  - **Partly done.** `AppContext._load_recoverable_jobs_from_repo()` now adds
++  completed non-demo jobs from `scan()["completed"]` to the `JobManager`, and
++  the repository exposes `list_completed_real()` / `scan()["completed_real"]`.
++  The Jobs screen still renders only what `JobManager` holds, and the
++  restart-to-open path is still not end-to-end complete (see the priority
++  slice above).
+ 
+ ## Phase 3 — Runtime adapters
+ 
+--- a/checklist.md
++++ b/checklist.md
+@@ -174,13 +174,18 @@
+ 
+ - [ ] State is persisted after meaningful checkpoints.
+   - `JobRepository` has disk-backed atomic metadata/checkpoint writes, and the
+-  transcript adapter writes checkpoints/artifacts. Standard `MainWindow` does
+-  not configure the repository, and the transcript adapter does not create a
+-  completed Job metadata record; full application persistence remains open.
++  transcript adapter writes checkpoints/artifacts. The repository is now
++  configured on every normal startup (`AppContext` resolves the jobs root
++  itself), and the UI layer persists a COMPLETE REAL Job record after a
++  successful transcript. The end-to-end restart-to-open flow is still open;
++  see § P.
+ 
+ - [ ] Startup recovery discovers incomplete jobs.
+-  - `JobRepository.scan()` and conditional `AppContext` loading exist, but
+-  normal startup does not pass `jobs_dir`. No job is auto-resumed.
++  - `JobRepository.scan()` and `AppContext` loading exist and run on every
++  startup, and completed REAL records are now discovered separately
++  (`scan()["completed_real"]`, `list_completed_real()`). **Corrected:** the
++  previous claim that "normal startup does not pass `jobs_dir`" was stale.
++  No job is auto-resumed — opening stays an explicit user action.
+ 
+ - [x] Jobs screen distinguishes resumable, failed, stopped, and complete jobs.
+   - `mmnext/ui/screens/jobs_screen.py` renders a `QTableView` with a
+@@ -731,9 +736,14 @@
+   shows a validation summary panel.
+ 
+ - [ ] User can recover stopped and incomplete jobs.
+-  - `JobRepository.scan()` and conditional `AppContext` startup loading exist,
+-  but standard `MainWindow` startup does not supply `jobs_dir`; completed jobs
+-  are not loaded into the Jobs screen. End-to-end recovery remains incomplete.
++  - `JobRepository.scan()` and `AppContext` startup loading exist and now run
++  on every startup, because `AppContext` resolves the jobs root itself.
++  Completed REAL records are discovered separately via
++  `scan()["completed_real"]` / `list_completed_real()` and are added to the
++  `JobManager` at startup. **Corrected:** the previous claim that "standard
++  `MainWindow` startup does not supply `jobs_dir`" was stale. End-to-end
++  recovery (open a discovered job and land in the workspace) still remains
++  incomplete — see § P.
+ 
+ - [x] No feature is marked complete without evidence.
+   - Every checked item in this file cites a test name, a file path, or a
+@@ -831,7 +841,9 @@
+ ### Шинэ шалгалтын баримт
+ 
+ - [x] Бүтэн тестийн багцыг бодит local media/model smoke тохируулгатай ажиллуулахад **291 passed in 63.32s**, skip/failure байхгүй. Команд: `pytest tests -q --confcutdir=tests -p no:cacheprovider`; зөвшөөрөгдсөн fixture/model зам болон project-local FFmpeg хэрэгслийг тухайн process-ийн орчинд тохируулсан.
++  - **Дараагийн ээлжлэн хувирсан дүн (canonical fingerprint fix cycle):** **342 passed, 1 skipped in 70.89s**. `skip` байгаа нь `tests/test_transcript_regressions.py:158` — зөвшөөрөгдсөн media fixture болон орон нисангийн Whisper model шаардлагатай тул орхигдсон. Энэ дүн нь дээрх 291-ийг орлоно.
+ - [x] `tests/test_transcript_open.py` тусгай шалгалт **6 passed in 0.27s**.
++  - **Дараагийн ээлжлэн хувирсан дүн:** `tests/test_transcript_open.py tests/test_job_repository.py tests/test_live_transcript_workspace.py` → **32 passed in 11.17s**.
+ - [x] Timestamp-boundary бодит acceptance болон REAL UI-д холбоос шалгалт § N-д нотолгоотой хэвээр.
+ - [ ] Энэ нь GPU, урт/олон хэлний материал, цэвэр Windows машинд суулгалт, эсвэл бүтээгдэхүүний бүрэн үйлдвэрлэлийн бэлэн байдлыг батлахгүй.
+ 
+@@ -840,25 +852,39 @@
+ - [x] `JobsScreen`-д **Open transcript** товч, `AppContext.open_transcript_from_job()` уншиж ажлын хэсэгт холбох зам бий. Арга нь repository-оос COMPLETE REAL job шаардаж, artifact-ийн schema v1, `is_demo=False`, эх сурвалжийн canonical замын ижил файлыг шалгаж, row-уудыг session болон Exact Dubbing source rows-д холбодог. Хадгалсан Burmese орчуулгыг шинээр зохиохгүй; хоосон хэвээр.
+ - [x] Зургаан тест хүчинтэй нээх, artifact байхгүй, demo artifact, дуусаагүй job, source path зөрөх, Exact Dubbing эх талбарын хадгалалтыг шалгана.
+ - [ ] **Энгийн апп эхлүүлэлтэд restart-to-open бүрэн ажиллахгүй.** `MainWindow` нь `AppContext()`-ийг `jobs_dir`-гүй үүсгэдэг. `AppContext`-ийн startup scan зөвхөн `jobs_dir` өгөгдвөл ажиллана.
++  - **Засвар (canonical fingerprint fix cycle):** энэ өгүүлбэр одоо **худал**. `AppContext` нь `jobs_dir`-г өөрөө тогтоодно — `$MMNEXT_JOBS_DIR`, байхгүй бол `~/.mmnext/jobs` — мөн үргэлж `JobRepository`-г байгуулж, startup scan-ийг ажиллуулна. `AppContext()`-ийг аргументгүй үүсгэж болохыг ажиллуулж баталгаажууллаа. Гэвч restart-to-open урсгал өөрөө дуусаагүй байна. § P-г үзнэ үү.
+ - [ ] Transcript adapter artifact болон checkpoint бичдэг боловч transcript-д зориулсан COMPLETE Job metadata record үүсгэхгүй. Repository scan нь COMPLETE job-уудыг recoverable жагсаалтад оруулдаггүй тул шинээр эхлүүлсэн Jobs дэлгэцэд өмнөх completed transcript автоматаар илрэхгүй.
++  - **Засвар:** repository нь одоо COMPLETE REAL job-уудыг тусдаа олдож чадна — `scan()["completed_real"]` болон `list_completed_real()`. `AppContext` эхлүүлэлтэд тэдгээрийг `JobManager`-д нэмнэ. COMPLETE Job metadata-г бичдэг нь UI даврга (adapter биш).
+ - [ ] Artifact дотор `fingerprint` хадгалагдсан ч reopen код одоогоор түүнийг одоогийн source-ийн fingerprint-тэй **харьцуулдаггүй**. Artifact JSON-д mode талбар байхгүй тул artifact mode-ийг тусад нь баталгаажуулахгүй; job-ийн mode-оор замыг тооцно.
++  - **Засвар (дутуу байгаа хэсэг):** artifact-д `mode`, `fingerprint`, `fingerprint_settings`, `fingerprint_schema_version`, `fingerprint_source_type` талбарууд нэмэгдсэн бөгөөд reopen код `fingerprint`-ийг харьцуулж байгаа. **Гэвч** reopen код тооцоолж байгаа нь artifact-ийн `fingerprint_settings`-г **ашиглахгүй** тул бодит adapter-ийн artifact-ийг хүрэлцэхэд `ValueError: Fingerprint mismatch between artifact and current source` гарч байна. Иймээс одоогийн нөхцөл: **зөвхөн canonical fingerprint-ийг хэрэглэдэг adapter-ийн artifact л хүлээн зөвшөөрөгдөнө**; хуучин artifact-ийг ялгаж татдаг. § P-г үзнэ үү.
+ - [ ] Loader row бүрийн ID хоосон биш, `start >= 0`, `duration > 0` гэдгийг л шалгана; давхардсан ID, finite timestamp, source duration-ийн дотор багтах эсэхийг бүрэн шалгахгүй. Нээх үеийн JSON уншилт/парсинг GUI thread дээр синхрон явагдана.
++  - **Засвар:** row-ийн шалгалт одоо бүрэн — хоосон ID, **давхардсан ID**, `NaN`/finite-биш `start`, `duration <= 0`, finite-биш `end`, мөн artifact duration-аас хэтэрсэн `end` бүгд хасагдана. Гэвч JSON уншилт/парсинг **одоо ч** GUI thread дээр синхрон явагдана.
+ - [ ] Одоогийн 6 focused test нь UI товчны end-to-end/GUI-thread ачаалалт, fingerprint mismatch, schema mismatch/corruption, mode mismatch, дутуу/давхардсан/хязгаараас гадуурх row-уудыг бүрэн хамрахгүй.
++  - **Нэмэлт:** `tests/test_fingerprint.py` (**40 passed in 1.61s**) нь canonical fingerprint-ийг, adapter болон repository-ийн нэг утга болдгийг, artifact-ийн fingerprint хүүхдүүдийг, legacy fingerprint-ийг ялгахыг шалгана. Гэвч бодит adapter-ийн artifact-аар **бодит reopen** хийсэн шалгалт, зэрэг GUI thread-ийн ачаалалтын шалгалт, `mode` зөрүүний шалгалт, artifact path-ийн containment шалгалт, хуучин artifact-ыг ялгах шалгалт **үлдсэн байна**.
+ 
+ ### Нэгдүгээр эрэмбийн дараагийн ажил — Jobs persistence/reopen босоо slice
+ 
+-- [ ] Одоогийн Step-5 transcript-open кодын талаар тусдаа, зөвхөн унших NVIDIA Nemotron review хийлгэж, дүгнэлтийг эх код/тестээр баталгаажуулах. Prompt: `outputs/nemotron-review-prompt-step5-transcript-reopen.md`.
+-- [ ] Хэрэглэгчийн эрхтэй, тогтвортой jobs root-ийг энгийн апп эхлүүлэх үед тохируулах; demo ба REAL тохиргоог тодорхой салгах.
++- [x] Одоогийн Step-5 transcript-open кодын талаар тусдаа, зөвхөн унших NVIDIA Nemotron review хийлгэж, дүгнэлтийг эх код/тестээр баталгаажуулах. Prompt: `outputs/nemotron-review-prompt-step5-transcript-reopen.md`.
++  - **Хийгдсэн.** Nemotron-ийн дүгнэлт: **REJECT** — 16 олдвор, 7 нь агуу түвшин (critical). Олдвор бүрийг эх код болон ажиллуулсан тестээр давхар шалгаж, засварын дарааллыг гаргасан.
++- [x] Хэрэглэгчийн эрхтэй, тогтвортой jobs root-ийг энгийн апп эхлүүлэх үед тохируулах; demo ба REAL тохиргоог тодорхой салгах.
++  - **Хийгдсэн.** `AppContext` нь `$MMNEXT_JOBS_DIR`, байхгүй бол `~/.mmnext/jobs` гэж тогтоод, үргэлж repository-г байгуулна. Demo ба REAL ялгаа нь `Job.is_demo`-оор хадгалагддаг.
+ - [ ] Транскрипт хүчинтэй болж atomic artifact commit амжилттай дууссаны дараа л source, mode, fingerprint, schema, artifact path болон COMPLETE төлөвтэй Job metadata-г хадгалах.
++  - **Хэсэгчлэн хийгдсэн:** UI даврга artifact-ыг шалгасны дараа COMPLETE REAL Job-ийг хадгалж, алдаа гарвал log руу бичиж, төлөвийг `failed` болгоно. `Job.fingerprint` болон `Job.artifact_path` нь metadata-руу шинээр round-trip хийгдэхэд болсон.
+ - [ ] Restart үед дууссан REAL transcript job болон сэргээж болох incomplete job-уудыг Jobs дэлгэцэд харуулах; completed transcript-ийг зөвхөн хэрэглэгчийн сонголтоор нээх. Автоматаар resume хийхгүй.
++  - **Хэсэгчлэн хийгдсэн:** completed REAL job-ууд `scan()["completed_real"]` болон `list_completed_real()`-аар олдоно, `AppContext` эхлүүлэлтэд `JobManager`-д нэмнэ. Автоматаар resume хийхгүй гэсэн шаардлага биелсэн. Гэвч Jobs дэлгэцэд бүрэн харагдах ба бодит reopen ажиллах урсгал дуусаагүй.
+ - [ ] Reopen шалгалтад job/artifact төлөв, schema, mode, source identity/fingerprint, unique ID болон finite/bounded timestamps оруулах; ямар нэг шалгалт унавал demo fallback хийхгүй, өмнөх session/эх row-уудыг өөрчлөхгүй.
++  - **Хэсэгчлэн хийгдсэн:** төлөв, schema, source identity/fingerprint, unique ID, finite/bounded timestamps оруулсан. **Үлдсэн:** artifact-ийн `mode`-ийг харьцуулахгүй, хуучин (legacy) artifact-ыг ялгаж татдаггүй, artifact path-ийн containment шалгалтгүй. Мөн reopen-ийн fingerprint-ийн тооцоолол artifact-ийн settings-гүй тул бодит artifact-ыг хүрэлцэхэд зөрчил гарна.
+ - [ ] Том artifact уншилт/validation-ийг GUI thread-ээс гаргах; ажил дуусах үед сонгосон job/source солигдсон бол хуучин үр дүнг холбохгүй.
++  - **Үлдсэн.**
+ - [ ] Амжилттай open, restart discovery, муу/дутуу/incompatible artifact, source/fingerprint/mode зөрүү, duplicate/out-of-range rows, off-GUI-thread ажиллагаа, UI failure visibility болон Exact Dubbing immutable-field invariants-ийг тестлэх.
++  - **Хэсэгчлэн хийгдсэн:** `tests/test_fingerprint.py` (40 шалгалт), `tests/test_job_repository.py`, `tests/test_transcript_regressions.py`, `tests/test_transcript_integration.py`, `tests/test_real_transcript.py` — fingerprint, discovery, row шалгалт, failure visibility хамрагдсан. **Үлдсэн:** бодит adapter artifact-аар reopen, off-GUI-thread ажиллагаа, `mode` зөрүү, containment, legacy artifact ялгалт.
+ - [ ] Шинэ бүтэн suite, strict transcript acceptance, Jobs→Workspace restart flow-ийн бодит integration шалгалт бүгд амжилттай болсны дараа л энэ slice-ийг дууссан гэж тэмдэглэх.
++  - **Үлдсэн.** Бүтэн suite **342 passed, 1 skipped**. Strict acceptance болон бодит integration урсгал дуусаагүй.
+ 
+ ### Томоохон үлдсэн ажлын дараалал
+ 
+ 1. Jobs persistence/reopen/recovery-ийг энгийн аппын бодит урсгалд холбож баталгаажуулах.
++   - **Одоогийн төлөв:** canonical fingerprint нэгтгэсэн, completed REAL job олдох, jobs root бүрэн тохируулагдсан. **Үлдсэн:** reopen-ийн fingerprint-ийн тооцоололд artifact-ийн `fingerprint_settings`-г хэрэглэх, artifact `mode`-ийг харьцуулах, legacy artifact-ыг ялгах, artifact path containment шалгах, artifact уншилтыг GUI thread-ээс гаргах, хуучин үр дүнг холбохгүй байх (stale guard), бодит adapter artifact-аар reopen шалгалт.
+ 2. Narrator Mode-ийн бодит plan/translation/TTS/Smart Sync adapter-уудыг тус тусад нь нэмж, safe stop/reuse болон үр дүнгийн validation-тай босоо урсгал болгох.
+ 3. Exact Dubbing-ийн prepare/export, TTS/cache/speech fitting/final duration ба audio validation-ийг нэмж, immutable dialogue contract-ийг хадгалах.
+ 4. Splitter-ийн planner, smart-cut/short-tail rules, per-part artifact/checkpoint/resume-ийг холбох.
+@@ -866,3 +892,32 @@
+ 6. Windows packaging, diagnostics, recovery cleanup, non-ASCII/Myanmar paths, CPU/GPU, clean-machine болон user-guide release шалгалтыг дуусгах.
+ 
+ Одоогийн бодит хязгаар: translation, Gemini, TTS болон final video rendering холбогдоогүй; ямар ч simulated/demo алхмыг бодит production completion гэж тооцохгүй.
++
++
++## P. Canonical fingerprint fix cycle — баталгаажилсан төлөв (Nemotron REJECT-ийн дараа)
++
++Энэ хэсэг нь Nemotron-ийн **REJECT** (16 олдвор, 7 агуу түвшин) дараах засвар хийсний дараах **бодитоор ажиллуулж баталгаажуулсан** төлөв юм. Дээрх § O-ийн хуучин бичлэгүүдийг устгаагүй; тэдгээрийн доторх "засвар" тэмдэглэгээнүүдээр ялгаатай.
++
++### Өөрчилсөн файлууд ба шалтгаан
++
++- `mmnext/domain/fingerprint.py` (**шинэ**, 236 мөр) — `canonical_fingerprint(source_path, source_type, mode, settings=None, schema_version=...)` гэсэн **цорын ганц** алгоритм. `fp2:<sha1hex>` хэлбэртэй. `FingerprintError`, `normalize_source_type`, `normalize_source_path`, `is_canonical_fingerprint`, `is_source_available`, `require_source_available` мөн энд. Qt-ийг импорт хийхгүй — domain даврга Qt-гүй байх дүрэмтэй.
++- `mmnext/domain/__init__.py` — `__all__` жагсаалтад `"fingerprint"` нэмэгдсэн.
++- `mmnext/domain/models.py` — `JobCheckpoint` дээр `fingerprint_settings`, `fingerprint_source_type`, `fingerprint_schema_version` талбарууд төгсгөлд нь нэмэгдэж, `to_dict`/`from_dict`-д round-trip хийгдэв. `CHECKPOINT_SCHEMA_VERSION = 2`-ыг **өөрчлөөгүй**.
++- `mmnext/infrastructure/repository/job_repository.py` — `compute_fingerprint()` хэвээ байгаа боловч одоо canonical функцийг дуудана; хуучин `local` гэдэг нөхцөл (`local_file` гэсэн enum утгатай үл зөрөх) асуудалтай `_source_identity`/`_file_meta`/`_sha1_hex` хасагдсан; `Job.fingerprint` ба `Job.artifact_path` metadata-руу round-trip хийгдэв; `scan()`-д `completed`, `completed_real` нэмэгдсэн; `list_completed_real(source_path=None)` шинэ; `can_resume_job` нь checkpoint-ийн settings-ийг ашиглана.
++- `mmnext/infrastructure/transcript_adapter.py` — `_fingerprint` нь canonical функцийг дуудана; шинэ `_fingerprint_settings`; artifact JSON-д `mode`, `fingerprint_settings`, `fingerprint_schema_version`, `fingerprint_source_type` бичигдэнэ. `hashlib`/`json` импорт хасагдсан. **Энэ файлын кодонд "translate" гэсэн үг оруулахгүй** — `tests/test_transcript_integration.py` шууд текстээр шалгадаг.
++- `tests/test_fingerprint.py` (**шинэ**, 40 шалгалт) — canonical алгоритм, adapter ба repository-ийн нэг утга болдог, artifact-ийн fingerprint хүүхдүүд, legacy fingerprint ялгалт, `Job.fingerprint` round-trip, legacy metadata ⇒ `""`, `JobCheckpoint`-ийн гурван талбарын round-trip, completed REAL discovery, бодит adapter artifact-ыг шалгах.
++- `.work/review-baselines/transcript-reopen-fixcycle-01/` — эхний хувилбарын byte хуулбарууд, `manifest.sha256`, `changes.diff`, `changed-files.sha256`, `README.md`. Git байхгүй учраас энэ нь өөрчлөлтийн баталгаа юм.
++
++### Задлан шалгасан үр дүн
++
++- `.\.venv\Scripts\python.exe -m pytest tests -q --confcutdir=tests -p no:cacheprovider` → **342 passed, 1 skipped in 70.89s**. `skip`: `tests/test_transcript_regressions.py:158` (зөвшөөрөгдсөн media fixture болон орон нисангийн Whisper model шаардлагатай).
++- `.\.venv\Scripts\python.exe -m pytest tests\test_fingerprint.py -q --confcutdir=tests -p no:cacheprovider` → **40 passed in 1.61s**.
++- `.\.venv\Scripts\python.exe -m pytest tests\test_job_repository.py tests\test_transcript_regressions.py tests\test_transcript_integration.py tests\test_real_transcript.py -q --confcutdir=tests -p no:cacheprovider` → **70 passed, 1 skipped in 2.73s**.
++- `.\.venv\Scripts\python.exe -m pytest tests\test_transcript_open.py tests\test_job_repository.py tests\test_live_transcript_workspace.py -q --confcutdir=tests -p no:cacheprovider` → **32 passed in 11.17s**.
++
++### Одоо ч үнэн биш байгаа зүйлс
++
++- **Бодит artifact-ыг reopen хийхэд fingerprint зөрчил гарна.** Reopen код artifact-ийн `fingerprint_settings`-г ашиглахгүйгээр тооцоолдог тул бодит adapter-ийн artifact-ийг `ValueError: Fingerprint mismatch between artifact and current source` гэж хасаж байна. Ажиллуулж баталгаажуулсан.
++- Artifact-ийн `mode` харьцуулагдахгүй, legacy artifact ялгагдахгүй, artifact path-ийн containment шалгалтгүй, artifact уншилт GUI thread дээр, stale-result guard байхгүй — эдгээрийг UI давргын эзлэх хэсэг хариулж байна.
++- Бодит Whisper smoke болон бүтэн resume урсгал дуусаагүй; GUI, mpv, FFmpeg-ийг шалгаагүй.
++- `outputs/`-ийн prompt-ийг өөрчлөөгүй.
+--- a/mmnext/domain/fingerprint.py
++++ b/mmnext/domain/fingerprint.py
+@@ -0,0 +1,232 @@
++"""One canonical fingerprint contract for every persisted artefact.
++
++A fingerprint answers a single question: *is the artefact I am about to
++reuse still describing the same inputs?*  Historically this repository had
++three different answers (the job repository helper, the transcript adapter
++method and the download worker method), and they disagreed - a transcript
++written by the real adapter could never be re-opened by the job repository.
++
++This module defines the single canonical algorithm.  Every producer (the
++transcript adapter, the job repository) and every consumer (the re-open
++path, the resume check) must use it, so a value computed while writing an
++artefact is byte-identical to the value computed while verifying it.
++
++Rules of the canonical form:
++
++* the source type is normalised, so ``"local"`` and ``"local_file"`` (and
++  :class:`~mmnext.domain.enums.SourceType.LOCAL_FILE`) are one identity;
++* the source path is normalised once (extended-length prefix removed, path
++  made absolute and case-folded) so a forward-slash path and a back-slash
++  path for the same file agree;
++* a local file contributes its *real* size and nanosecond mtime;
++* a missing local file is hashed with an explicit ``absent`` marker and
++  never with zero-filled metadata, so an unavailable source can never be
++  mistaken for the file it replaced;
++* the mode, the fingerprint schema version and the settings that produced
++  the artefact all participate, so the same video in a different mode or
++  with different transcription settings never shares a fingerprint.
++
++The module is part of the pure domain layer: it imports no Qt, no
++application and no infrastructure code.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from typing import Any, Dict, Mapping, Optional, Tuple
++
++from .enums import AppMode, SourceType
++
++__all__ = [
++    "FINGERPRINT_PREFIX",
++    "FINGERPRINT_SCHEME",
++    "FINGERPRINT_SCHEMA_VERSION",
++    "FingerprintError",
++    "canonical_fingerprint",
++    "is_canonical_fingerprint",
++    "is_source_available",
++    "require_source_available",
++    "normalize_source_path",
++    "normalize_source_type",
++]
++
++#: Prefix of every canonical fingerprint.  A value without it is a legacy
++#: (pre-contract) fingerprint and must be treated as unverifiable.
++FINGERPRINT_PREFIX = "fp2:"
++
++#: Scheme marker mixed into the hashed payload.
++FINGERPRINT_SCHEME = "mmnext-fingerprint-v2"
++
++#: Version of the *fingerprint input* schema.  Bump it when the hashed
++#: payload layout changes so old values can never be compared silently.
++FINGERPRINT_SCHEMA_VERSION = 1
++
++_LOCAL_ALIASES = frozenset({"local", "local_file", "localfile", "file"})
++_REMOTE_ALIASES = frozenset({"youtube", "yt", "remote", "url"})
++
++
++class FingerprintError(ValueError):
++    """Raised when a fingerprint cannot be computed or verified."""
++
++
++def normalize_source_type(source_type: Any) -> str:
++    """Return the canonical name of ``source_type``.
++
++    Accepts a plain string or a :class:`~mmnext.domain.enums.SourceType`
++    member.  ``"local"`` and ``"local_file"`` collapse onto
++    ``"local_file"`` so the historic alias cannot produce a second,
++    conflicting identity for the same file.
++    """
++    if source_type is None:
++        return ""
++    value = getattr(source_type, "value", source_type)
++    text = str(value).strip().lower()
++    if text in _LOCAL_ALIASES:
++        return SourceType.LOCAL_FILE.value
++    if text in _REMOTE_ALIASES:
++        return SourceType.YOUTUBE.value
++    return text
++
++
++def normalize_source_path(source_path: Any) -> str:
++    """Return the canonical absolute form of ``source_path``.
++
++    The Windows extended-length prefix (``\\\\?\\``) is removed, the path is
++    made absolute against the current working directory and case-folded, so
++    ``"C:/videos/a.mp4"`` and ``"c:\\videos\\a.mp4"`` describe one file.
++    """
++    text = str(source_path or "").strip()
++    if not text:
++        return ""
++    if text.startswith("\\\\?\\"):
++        text = text[4:]
++        if text.startswith("UNC\\"):
++            text = "\\\\" + text[4:]
++    try:
++        resolved = os.path.realpath(text)
++    except (OSError, ValueError):  # pragma: no cover - defensive
++        resolved = os.path.abspath(text)
++    return os.path.normcase(os.path.abspath(resolved))
++
++
++def _file_state(identity: str) -> Tuple[str, str, str]:
++    """Return ``(state, size, mtime_ns)`` for a local file.
++
++    ``state`` is ``"present"`` or ``"absent"``.  An absent file never
++    reports zero size and zero mtime as if they were real metadata: the
++    explicit ``"absent"`` marker is hashed instead, which can never match a
++    fingerprint recorded for the file itself.
++    """
++    if not identity:
++        return ("absent", "0", "0")
++    try:
++        stat = os.stat(identity)
++    except OSError:
++        return ("absent", "0", "0")
++    return ("present", str(int(stat.st_size)), str(int(stat.st_mtime_ns)))
++
++
++def _settings_payload(settings: Any) -> Dict[str, Any]:
++    if settings is None:
++        return {}
++    if isinstance(settings, dict):
++        return settings
++    if isinstance(settings, Mapping):
++        return dict(settings)
++    try:
++        return dict(settings)
++    except (TypeError, ValueError):
++        return {"_settings": str(settings)}
++
++
++def canonical_fingerprint(
++    source_path: str,
++    source_type: str,
++    mode: AppMode,
++    settings: Optional[Dict[str, Any]] = None,
++    schema_version: int = FINGERPRINT_SCHEMA_VERSION,
++) -> str:
++    """Return the canonical fingerprint of one artefact's inputs.
++
++    The same inputs always produce the same value, and the value changes
++    whenever the source file, the source type, the mode, the fingerprint
++    schema version or the settings change.  The result is prefixed with
++    ``"fp2:"`` so legacy values stay recognisable.
++    """
++    stype = normalize_source_type(source_type)
++    identity = normalize_source_path(source_path)
++    mode_value = str(getattr(mode, "value", mode) or "")
++
++    if stype == SourceType.LOCAL_FILE.value:
++        state, size, mtime_ns = _file_state(identity)
++    elif stype == SourceType.YOUTUBE.value:
++        state, size, mtime_ns = ("remote", "0", "0")
++    else:
++        state, size, mtime_ns = ("unknown", "0", "0")
++
++    settings_json = json.dumps(
++        _settings_payload(settings),
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=False,
++        default=str,
++    )
++    try:
++        schema = int(schema_version)
++    except (TypeError, ValueError):
++        schema = 0
++
++    raw = "|".join(
++        (
++            FINGERPRINT_SCHEME,
++            stype,
++            identity,
++            state,
++            size,
++            mtime_ns,
++            mode_value,
++            str(schema),
++            settings_json,
++        )
++    )
++    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
++    return f"{FINGERPRINT_PREFIX}{digest}"
++
++
++def is_canonical_fingerprint(value: Any) -> bool:
++    """Whether ``value`` was produced by :func:`canonical_fingerprint`."""
++    text = str(value or "")
++    if not text.startswith(FINGERPRINT_PREFIX):
++        return False
++    digest = text[len(FINGERPRINT_PREFIX):]
++    if len(digest) != 40:
++        return False
++    return all(char in "0123456789abcdefABCDEF" for char in digest)
++
++
++def is_source_available(source_path: str, source_type: Any = SourceType.LOCAL_FILE.value) -> bool:
++    """Whether the media behind ``source_path`` can still be read."""
++    stype = normalize_source_type(source_type)
++    if stype != SourceType.LOCAL_FILE.value:
++        return True
++    identity = normalize_source_path(source_path)
++    if not identity:
++        return False
++    return os.path.isfile(identity)
++
++
++def require_source_available(
++    source_path: str,
++    source_type: Any = SourceType.LOCAL_FILE.value,
++) -> str:
++    """Return the normalised path of ``source_path`` or raise.
++
++    Raises :class:`FingerprintError` when a local source is missing, so a
++    caller can offer a clear "the media is gone" message instead of
++    comparing fingerprints of two different states of the world.
++    """
++    if not is_source_available(source_path, source_type):
++        raise FingerprintError(f"Source media is unavailable: {source_path}")
++    return normalize_source_path(source_path)
+--- a/tests/test_fingerprint.py
++++ b/tests/test_fingerprint.py
+@@ -0,0 +1,414 @@
++"""Contract tests for the single canonical fingerprint algorithm.
++
++Every producer and consumer of a persisted artefact must agree on one
++algorithm.  These tests pin that agreement so the repository helper, the
++transcript adapter and the re-open path can never drift apart again.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from mmnext.domain.enums import AppMode, JobState, SourceType
++from mmnext.domain.fingerprint import (
++    FINGERPRINT_PREFIX,
++    FINGERPRINT_SCHEMA_VERSION,
++    FingerprintError,
++    canonical_fingerprint,
++    is_canonical_fingerprint,
++    is_source_available,
++    normalize_source_path,
++    normalize_source_type,
++    require_source_available,
++)
++from mmnext.domain.models import Job, JobCheckpoint, VideoSource
++from mmnext.infrastructure.repository.job_repository import (
++    JOB_SCHEMA_VERSION,
++    JobRepository,
++    compute_fingerprint,
++)
++
++
++# --------------------------------------------------------------------------- #
++# The public helper must stay a thin, stable façade over the canonical
++# function - the UI and the tests both call it by name.
++# --------------------------------------------------------------------------- #
++def test_repository_helper_delegates_to_canonical_function():
++    source = "C:/videos/a.mp4"
++    assert compute_fingerprint(source, "local", AppMode.NARRATOR) == canonical_fingerprint(
++        source, "local", AppMode.NARRATOR
++    )
++
++
++def test_repository_helper_keeps_its_keyword_signature():
++    source = "C:/videos/a.mp4"
++    by_positional = compute_fingerprint(source, "local", AppMode.NARRATOR, {"rate": 1.0}, 1)
++    by_keyword = compute_fingerprint(
++        source_path=source,
++        source_type="local",
++        mode=AppMode.NARRATOR,
++        settings={"rate": 1.0},
++        schema_version=1,
++    )
++    assert by_positional == by_keyword
++
++
++def test_canonical_values_carry_the_prefix():
++    value = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR)
++    assert value.startswith(FINGERPRINT_PREFIX)
++    assert is_canonical_fingerprint(value)
++
++
++def test_legacy_fingerprint_is_not_canonical():
++    import hashlib
++
++    legacy = hashlib.sha1(b"old").hexdigest()
++    assert not is_canonical_fingerprint(legacy)
++    assert not is_canonical_fingerprint("")
++    assert not is_canonical_fingerprint(None)
++
++
++# --------------------------------------------------------------------------- #
++# Determinism
++# --------------------------------------------------------------------------- #
++def test_same_inputs_produce_the_same_value():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    b = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    assert a == b
++
++
++def test_adapter_and_repository_agree(tmp_path):
++    source = tmp_path / "movie.mp4"
++    source.write_bytes(b"media bytes")
++    settings = {"language": "en", "auto_detect": False, "model": "base", "schema": 1}
++    from_adapter = canonical_fingerprint(str(source), "local_file", AppMode.NARRATOR, settings=settings)
++    from_repository = compute_fingerprint(
++        str(source), "local_file", AppMode.NARRATOR, settings=settings
++    )
++    assert from_adapter == from_repository
++
++
++# --------------------------------------------------------------------------- #
++# Sensitivity: every input that changes the artefact must change the value
++# --------------------------------------------------------------------------- #
++def test_settings_change_the_value():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR, settings={"rate": 1.0})
++    b = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR, settings={"rate": 1.1})
++    assert a != b
++
++
++def test_mode_changes_the_value():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR)
++    b = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.EXACT_DUBBING)
++    assert a != b
++
++
++def test_source_path_changes_the_value():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR)
++    b = canonical_fingerprint("C:/videos/b.mp4", "local", AppMode.NARRATOR)
++    assert a != b
++
++
++def test_schema_version_changes_the_value():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR, schema_version=1)
++    b = canonical_fingerprint("C:/videos/a.mp4", "local", AppMode.NARRATOR, schema_version=2)
++    assert a != b
++
++
++def test_file_content_change_changes_the_value(tmp_path):
++    source = tmp_path / "movie.mp4"
++    source.write_bytes(b"one")
++    first = canonical_fingerprint(str(source), "local_file", AppMode.NARRATOR)
++    source.write_bytes(b"two-different")
++    second = canonical_fingerprint(str(source), "local_file", AppMode.NARRATOR)
++    assert first != second
++
++
++# --------------------------------------------------------------------------- #
++# Source-type aliases must not create a second identity for the same file
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize(
++    "alias",
++    ["local", "local_file", "localfile", "file", SourceType.LOCAL_FILE, SourceType.LOCAL_FILE.value],
++)
++def test_local_aliases_collapse_onto_one_identity(alias):
++    assert normalize_source_type(alias) == SourceType.LOCAL_FILE.value
++    reference = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    assert canonical_fingerprint("C:/videos/a.mp4", alias, AppMode.NARRATOR) == reference
++
++
++@pytest.mark.parametrize(
++    "alias",
++    ["youtube", "yt", "remote", "url", SourceType.YOUTUBE, SourceType.YOUTUBE.value],
++)
++def test_remote_aliases_collapse_onto_one_identity(alias):
++    assert normalize_source_type(alias) == SourceType.YOUTUBE.value
++    reference = canonical_fingerprint("https://youtu.be/x", "youtube", AppMode.NARRATOR)
++    assert canonical_fingerprint("https://youtu.be/x", alias, AppMode.NARRATOR) == reference
++
++
++def test_local_and_remote_source_types_differ():
++    a = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    b = canonical_fingerprint("C:/videos/a.mp4", "youtube", AppMode.NARRATOR)
++    assert a != b
++
++
++# --------------------------------------------------------------------------- #
++# Path normalisation: the same file described two ways is one identity
++# --------------------------------------------------------------------------- #
++def test_path_normalisation_equates_separator_and_case_variants():
++    forward = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    backward = canonical_fingerprint("c:\\videos\\a.mp4", "local_file", AppMode.NARRATOR)
++    assert forward == backward
++
++
++def test_path_normalisation_strips_windows_extended_length_prefix():
++    plain = canonical_fingerprint("C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    extended = canonical_fingerprint("\\\\?\\C:/videos/a.mp4", "local_file", AppMode.NARRATOR)
++    assert plain == extended
++
++
++def test_relative_and_absolute_paths_agree(tmp_path, monkeypatch):
++    source = tmp_path / "a.mp4"
++    source.write_bytes(b"x")
++    monkeypatch.chdir(tmp_path)
++    absolute = canonical_fingerprint(str(source), "local_file", AppMode.NARRATOR)
++    relative = canonical_fingerprint("a.mp4", "local_file", AppMode.NARRATOR)
++    assert absolute == relative
++
++
++def test_normalize_source_path_is_idempotent():
++    once = normalize_source_path("C:/videos/a.mp4")
++    assert normalize_source_path(once) == once
++
++
++# --------------------------------------------------------------------------- #
++# A missing source must never look like a real file
++# --------------------------------------------------------------------------- #
++def test_missing_source_is_hashed_as_absent(tmp_path):
++    missing = str(tmp_path / "not-here.mp4")
++    assert not is_source_available(missing)
++    value = canonical_fingerprint(missing, "local_file", AppMode.NARRATOR)
++    assert is_canonical_fingerprint(value)
++
++
++def test_absent_source_never_matches_a_present_one(tmp_path):
++    source = tmp_path / "movie.mp4"
++    source.write_bytes(b"media")
++    present = canonical_fingerprint(str(source), "local_file", AppMode.NARRATOR)
++    absent = canonical_fingerprint(str(tmp_path / "movie.mp4.gone"), "local_file", AppMode.NARRATOR)
++    assert present != absent
++
++
++def test_require_source_available_raises_for_missing_media(tmp_path):
++    with pytest.raises(FingerprintError):
++        require_source_available(str(tmp_path / "gone.mp4"))
++    present = tmp_path / "here.mp4"
++    present.write_bytes(b"x")
++    assert require_source_available(str(present))
++
++
++def test_remote_source_is_always_available():
++    assert is_source_available("https://youtu.be/x", "youtube")
++
++
++# --------------------------------------------------------------------------- #
++# Persistence round-trips
++# --------------------------------------------------------------------------- #
++def test_job_fingerprint_round_trips_through_the_repository(tmp_path):
++    repo = JobRepository(tmp_path)
++    source = str(tmp_path / "movie.mp4")
++    Path(source).write_bytes(b"media")
++    fingerprint = canonical_fingerprint(source, "local_file", AppMode.NARRATOR)
++    job = Job(
++        job_id="fp_job",
++        title="Fingerprint",
++        mode=AppMode.NARRATOR,
++        state=JobState.COMPLETE,
++        is_demo=False,
++        source=VideoSource.local(source),
++        fingerprint=fingerprint,
++    )
++    repo.save(job, source)
++    loaded = repo.load("fp_job", source)
++    assert loaded is not None
++    assert loaded.fingerprint == fingerprint
++
++
++def test_legacy_metadata_without_fingerprint_loads_with_empty_value(tmp_path):
++    repo = JobRepository(tmp_path)
++    source = str(tmp_path / "movie.mp4")
++    job = Job(job_id="legacy", title="Legacy", mode=AppMode.NARRATOR, source=VideoSource.local(source))
++    repo.save(job, source)
++    meta_path = repo._metadata_path("legacy", source)
++    data = json.loads(meta_path.read_text(encoding="utf-8"))
++    data.pop("fingerprint", None)
++    data.pop("artifact_path", None)
++    meta_path.write_text(json.dumps(data), encoding="utf-8")
++    loaded = repo.load("legacy", source)
++    assert loaded is not None
++    assert loaded.fingerprint == ""
++
++
++def test_checkpoint_fingerprint_inputs_round_trip(tmp_path):
++    repo = JobRepository(tmp_path)
++    source = str(tmp_path / "movie.mp4")
++    settings = {"language": "en", "auto_detect": False, "model": "base", "schema": 1}
++    fingerprint = canonical_fingerprint(source, "local_file", AppMode.NARRATOR, settings=settings)
++    checkpoint = JobCheckpoint(
++        task_id="t1",
++        mode=AppMode.NARRATOR.value,
++        fingerprint=fingerprint,
++        fingerprint_settings=dict(settings),
++        fingerprint_source_type="local_file",
++        fingerprint_schema_version=FINGERPRINT_SCHEMA_VERSION,
++    )
++    repo.save_checkpoint("j1", source, AppMode.NARRATOR, checkpoint)
++    data = repo.load_checkpoint("j1", source, AppMode.NARRATOR)
++    assert data is not None
++    assert data["fingerprint"] == fingerprint
++    assert data["fingerprint_settings"] == settings
++    assert data["fingerprint_source_type"] == "local_file"
++    assert data["fingerprint_schema_version"] == FINGERPRINT_SCHEMA_VERSION
++
++
++# --------------------------------------------------------------------------- #
++# Completed REAL discovery
++# --------------------------------------------------------------------------- #
++def test_completed_real_jobs_are_discovered_separately(tmp_path):
++    repo = JobRepository(tmp_path)
++    source = str(tmp_path / "movie.mp4")
++    real = Job(
++        job_id="real_done",
++        title="Real",
++        mode=AppMode.NARRATOR,
++        state=JobState.COMPLETE,
++        is_demo=False,
++        source=VideoSource.local(source),
++        fingerprint=canonical_fingerprint(source, "local_file", AppMode.NARRATOR),
++    )
++    demo = Job(
++        job_id="demo_done",
++        title="Demo",
++        mode=AppMode.NARRATOR,
++        state=JobState.COMPLETE,
++        is_demo=True,
++        source=VideoSource.local(source),
++    )
++    repo.save(real, source)
++    repo.save(demo, source)
++
++    scan = repo.scan()
++    assert "completed_real" in scan
++    real_ids = {job.job_id for job, _ in scan["completed_real"]}
++    assert real_ids == {"real_done"}
++
++    listed = repo.list_completed_real()
++    assert [job.job_id for job in listed] == ["real_done"]
++    assert listed[0].fingerprint == real.fingerprint
++    assert listed[0].source is not None
++
++
++def test_completed_real_discovery_can_be_scoped_to_one_source(tmp_path):
++    repo = JobRepository(tmp_path)
++    first = str(tmp_path / "first.mp4")
++    second = str(tmp_path / "second.mp4")
++    for index, path in enumerate((first, second)):
++        job = Job(
++            job_id=f"job{index}",
++            title=f"Job {index}",
++            mode=AppMode.NARRATOR,
++            state=JobState.COMPLETE,
++            is_demo=False,
++            source=VideoSource.local(path),
++        )
++        repo.save(job, path)
++    scoped = repo.list_completed_real(source_path=first)
++    assert [job.job_id for job in scoped] == ["job0"]
++
++
++# --------------------------------------------------------------------------- #
++# The real adapter must produce a verifiable artefact
++# --------------------------------------------------------------------------- #
++def test_real_adapter_artifact_carries_verifiable_fingerprint(tmp_path, monkeypatch):
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    import mmnext.infrastructure.transcript_adapter as module
++    from mmnext.infrastructure.transcript_adapter import WhisperTranscriptAdapter
++
++    source = tmp_path / "movie.mp4"
++    source.write_bytes(b"source media")
++    adapter = WhisperTranscriptAdapter(str(tmp_path / "jobs"), str(source))
++    monkeypatch.setattr(adapter, "_probe_duration", lambda p: 10.0)
++    monkeypatch.setattr(adapter, "_prepare_audio", lambda p, d: (str(tmp_path / "audio.wav"), ""))
++    model = MagicMock()
++    model.transcribe.return_value = (
++        iter([SimpleNamespace(start=1.0, end=3.0, text="hello")]),
++        SimpleNamespace(language="en"),
++    )
++    monkeypatch.setattr(module, "WhisperModel", MagicMock(return_value=model))
++
++    rows, _ = adapter.transcribe(str(source), language="en")
++    assert rows
++
++    payload = json.loads(adapter.artifact_path.read_text(encoding="utf-8"))
++    assert payload["mode"] == AppMode.NARRATOR.value
++    assert payload["fingerprint_source_type"] == "local_file"
++    assert payload["fingerprint_schema_version"] == FINGERPRINT_SCHEMA_VERSION
++    assert payload["fingerprint_settings"] == {
++        "language": "en",
++        "auto_detect": False,
++        "model": adapter.whisper_model,
++        "schema": 1,
++    }
++    # A consumer can re-derive the value from the artefact alone.
++    recomputed = canonical_fingerprint(
++        payload["source_path"],
++        payload["fingerprint_source_type"],
++        AppMode(payload["mode"]),
++        settings=payload["fingerprint_settings"],
++        schema_version=payload["fingerprint_schema_version"],
++    )
++    assert recomputed == payload["fingerprint"]
++    # ... and the repository agrees with the adapter.
++    assert compute_fingerprint(
++        payload["source_path"],
++        payload["fingerprint_source_type"],
++        AppMode(payload["mode"]),
++        settings=payload["fingerprint_settings"],
++        schema_version=payload["fingerprint_schema_version"],
++    ) == payload["fingerprint"]
++
++
++def test_adapter_checkpoint_fingerprint_equals_artifact_fingerprint(tmp_path, monkeypatch):
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    import mmnext.infrastructure.transcript_adapter as module
++    from mmnext.infrastructure.transcript_adapter import WhisperTranscriptAdapter
++
++    source = tmp_path / "movie.mp4"
++    source.write_bytes(b"source media")
++    adapter = WhisperTranscriptAdapter(str(tmp_path / "jobs"), str(source))
++    monkeypatch.setattr(adapter, "_probe_duration", lambda p: 10.0)
++    monkeypatch.setattr(adapter, "_prepare_audio", lambda p, d: (str(tmp_path / "audio.wav"), ""))
++    model = MagicMock()
++    model.transcribe.return_value = (
++        iter([SimpleNamespace(start=1.0, end=3.0, text="hello")]),
++        SimpleNamespace(language="en"),
++    )
++    monkeypatch.setattr(module, "WhisperModel", MagicMock(return_value=model))
++
++    adapter.transcribe(str(source), language="en")
++    payload = json.loads(adapter.artifact_path.read_text(encoding="utf-8"))
++    checkpoint = adapter.repo.load_checkpoint(source.stem, str(source), adapter.mode)
++    assert checkpoint["fingerprint"] == payload["fingerprint"]
++    assert checkpoint["fingerprint_settings"] == payload["fingerprint_settings"]
++    assert checkpoint["fingerprint_source_type"] == payload["fingerprint_source_type"]
++
++
++def test_job_schema_version_is_unchanged():
++    assert JOB_SCHEMA_VERSION == 1

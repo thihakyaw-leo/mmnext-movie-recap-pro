@@ -1,0 +1,14 @@
+{
+  "speech": {
+    "ok": false,
+    "detail": "<HTTPError 406: 'Not Acceptable'>"
+  },
+  "model": {
+    "ok": true,
+    "detail": "model ready: J:\\mmnext-movie-recap-pro\\.work\\transcript-acceptance\\models\\tiny.en"
+  },
+  "tools": {
+    "ok": true,
+    "detail": "tools ready"
+  }
+}

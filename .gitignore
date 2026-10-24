@@ -1,0 +1,58 @@
+# -- virtual environments ------------------------------------------------ #
+.venv/
+venv/
+env/
+
+# -- Python --------------------------------------------------------------- #
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -- test output ---------------------------------------------------------- #
+.pytest_out.txt
+.pytest_err.txt
+.coverage
+htmlcov/
+
+# -- secrets and local configuration -------------------------------------- #
+.env
+.env.*
+!.env.example
+*.local.toml
+
+# -- generated media ------------------------------------------------------ #
+# Media output is never committed: it is large and it is derived data.
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.srt
+*.ass
+*.vtt
+*.partial
+*.part
+
+# -- job working directories ---------------------------------------------- #
+work/
+tts_parts/
+video_parts/
+run.log
+.stop_requested
+checkpoint.json
+
+# -- editors and OS ------------------------------------------------------- #
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
